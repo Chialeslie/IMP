@@ -1,0 +1,723 @@
+#include <Servo.h>
+#include <NewPing.h>
+#include <TinyGPS++.h>
+#include <Wire.h>
+#include <Adafruit_QMC5883P.h>
+#include <RPC.h>
+#include <Adafruit_Sensor.h>
+#include <mbed.h>
+#include <Arduino_GigaDisplay_GFX.h>
+#include <Arduino_GigaDisplayTouch.h>
+#include <Arduino.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// -------------------------------------------------------------
+// DISPLAY INITIALIZATION & COLOR MACROS
+// -------------------------------------------------------------
+#define GC9A01A_CYAN    0x07FF
+#define GC9A01A_RED     0xF800
+#define GC9A01A_BLUE    0x001F
+#define GC9A01A_GREEN   0x07E0
+#define GC9A01A_MAGENTA 0xF81F
+#define GC9A01A_WHITE   0xFFFF
+#define GC9A01A_BLACK   0x0000
+#define GC9A01A_YELLOW  0xFFE0
+
+GigaDisplay_GFX display;
+
+// -------------------------------------------------------------
+// SENSOR MODULES INITIALIZATION
+// -------------------------------------------------------------
+TinyGPSPlus gps;
+Adafruit_QMC5883P compass = Adafruit_QMC5883P();
+
+struct GPSData {
+  double latitude;
+  double longitude;
+  uint8_t satellites;
+  bool fix;
+} currentGPS = {0.0, 0.0, 0, false};
+
+int currentHeading = 0; 
+float imuRoll = 0;
+float imuPitch = 0;
+float imuGyroZ = 0;
+
+unsigned long lastPiPacketReceived = 0;
+unsigned long lastFlaskGpsSend = 0;
+// -------------------------------------------------------------
+// MOTOR AND SENSOR PIN CONFIGURATION
+// -------------------------------------------------------------
+const int R_EN = 23;   
+const int R_RPWM = 4;
+const int R_LPWM = 5;   
+const int L_EN = 27;
+const int L_RPWM = 6;   
+const int L_LPWM = 7;   
+const int LED_INDICATOR = 31;
+
+const int TRIG_F = 22, ECHO_F = 24;
+const int TRIG_L = 26, ECHO_L = 28;
+const int TRIG_R = 30, ECHO_R = 32;
+const int TRIG_B = 34, ECHO_B = 36;
+
+int ObstacleFront = 0;
+int ObstacleLeft  = 0;
+int ObstacleRight = 0;
+int ObstacleBack  = 0;
+uint8_t sensorIndex = 0; 
+
+int currentPanAngle = 135;
+int currentTiltAngle = 90;
+
+unsigned long lastSensorScan = 0;
+unsigned long lastCompassScan = 0;
+unsigned long lastImuScan = 0;
+const unsigned long LINK_TIMEOUT = 2000;
+bool isConnected = false;
+
+// Autonomous State Variables
+String piCommand = "IDLE";
+bool piEmergencyStop = false;
+bool stairApproachActive = false;
+int targetSteeringError = 0; 
+int targetBaseSpeed = 0;
+unsigned long lastUIUpdate = 0;
+String piStatus = "NONE";
+int currentDriveMode = 11;
+
+// Servo Declaration
+Servo panServo;
+Servo tiltServo;
+const int Pan = 2;
+const int Tilt = 3;
+
+// staircase climbing
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+unsigned long stairTimer = 0;
+int stairPhase = 0;
+int startAngles[4][3];
+int targetAngles[4][3];
+unsigned long phaseDuration = 1000;
+const float MAX_STAIR_PITCH = 25.0; // Maximum safe pitch angle in degrees
+bool stairAborted = false;
+
+void setupPCA9685() {
+  pwm.begin();
+  pwm.setPWMFreq(50); // 50Hz for analog servos
+}
+
+void write270Servo(uint8_t channel, int angle) {
+  angle = constrain(angle, 0, 270);
+  // Map 0-270 degrees to 500us - 2500us pulse width
+  int pulseWidth = map(angle, 0, 270, 500, 2500);
+  
+  // Convert pulse width in microseconds to 12-bit PCA9685 tick (at 50Hz, 1 tick = 5.08us)
+  int tick = map(pulseWidth, 0, 20000, 0, 4096);
+  pwm.setPWM(channel, 0, tick);
+}
+
+// Interpolates smoothly between a start angle and target angle based on progress (0.0 to 1.0)
+int smoothStep(int startAngle, int targetAngle, float progress) {
+  progress = constrain(progress, 0.0, 1.0);
+  return startAngle + (int)((targetAngle - startAngle) * progress);
+}
+
+// Map [Leg 0-3][Joint 0-2] to PCA9685 channel numbers (0-11)
+const int servoChannels[4][3] = {
+  {0, 1, 2},   // Front-Left (Hip, Femur, Tibia)
+  {3, 4, 5},   // Front-Right
+  {6, 7, 8},   // Rear-Left
+  {9, 10, 11}  // Rear-Right
+};
+
+void setLegAnglesWithMirror(int leg, int hip, int femur, int tibia); // forward declaration or inline logic
+
+void startNewPhase(int newPhase) {
+  stairPhase = newPhase;
+  stairTimer = millis();
+}
+
+void setLegAngles(int leg, int hipAngle, int femurAngle, int tibiaAngle) {
+  int actualHip = hipAngle;
+  int actualFemur = femurAngle;
+  int actualTibia = tibiaAngle;
+
+  // If Rear legs (2 and 3) are physical mirrors of Front legs (0 and 1)
+  if (leg == 2 || leg == 3) {
+    // Invert femur and tibia if their physical orientation is flipped
+    actualFemur = 270 - femurAngle; 
+    actualTibia = 270 - tibiaAngle; 
+  }
+
+  // If Right side legs (1 and 3) are mirrored relative to Left side (0 and 2)
+  if (leg == 1 || leg == 3) {
+    actualHip = 270 - hipAngle; // Invert hip swing direction for right side
+  }
+
+  write270Servo(servoChannels[leg][0], actualHip);
+  write270Servo(servoChannels[leg][1], actualFemur);
+  write270Servo(servoChannels[leg][2], actualTibia);
+}
+
+// HELPER FUNCTIONS FOR ULTRASONIC SENSORS
+
+int getSensorDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(4);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  long duration = pulseIn(echoPin, HIGH, 5800); 
+  if (duration == 0) return 0;
+  
+  int distance = duration * 0.034 / 2;
+  if (distance > 2 && distance <= 40) return 1;
+  return 0;
+}
+// HW-039 motor driver function
+void move(int RMotorP, int RMotorN, int LMotorP, int LMotorN) {
+  digitalWrite(R_EN, HIGH); 
+  digitalWrite(L_EN, HIGH);  
+  analogWrite(R_RPWM, RMotorP);
+  analogWrite(R_LPWM, RMotorN);
+  analogWrite(L_RPWM, LMotorP);
+  analogWrite(L_LPWM, LMotorN);
+}
+void move_forward(int Speed = 200) { move(Speed, 0, Speed, 0); }
+void move_backward(int Speed = 200) { move(0, Speed, 0, Speed); }
+void move_left(int SpeedR = 200, int SpeedL = 100) { move(SpeedR, 0, SpeedL, 0); }    
+void move_right(int SpeedR = 100, int SpeedL = 200) { move(SpeedR, 0, SpeedL, 0); }
+void move_stop() { move(0, 0, 0, 0); }
+void turn_spot_left(int Speed = 200)  { move(0, Speed, Speed, 0); }
+void turn_spot_right(int Speed = 200) { move(Speed, 0, 0, Speed); }
+
+// HW-039 motor driver for tracking 
+void TrackingSpeed (int leftSpeed, int rightSpeed) {
+  int l_rpwm = 0, l_lpwm = 0;
+  int r_rpwm = 0, r_lpwm = 0;
+
+  // Left Motor Direction & Speed
+  if (leftSpeed > 0) {
+    l_rpwm = constrain(leftSpeed, 0, 255);
+    l_lpwm = 0;
+  } else if (leftSpeed < 0) {
+    l_rpwm = 0;
+    l_lpwm = constrain(abs(leftSpeed), 0, 255);
+  }
+
+  // Right Motor Direction & Speed
+  if (rightSpeed > 0) {
+    r_rpwm = constrain(rightSpeed, 0, 255);
+    r_lpwm = 0;
+  } else if (rightSpeed < 0) {
+    r_rpwm = 0;
+    r_lpwm = constrain(abs(rightSpeed), 0, 255);
+  }
+
+  move(r_rpwm, r_lpwm, l_rpwm, l_lpwm);
+}
+
+// servo function
+void moveServo(Servo &s, int degrees, int maxDegrees) {
+  int pulse = map(degrees, 0, maxDegrees, 500, 2500);
+  s.writeMicroseconds(pulse);
+}
+
+// STATIC UI INITIALIZATION
+void setupUI() {
+  display.fillScreen(GC9A01A_BLACK);
+  display.fillRect(0, 0, 800, 60, GC9A01A_BLUE);
+  display.setCursor(110, 18);
+  display.setTextSize(3);
+  display.setTextColor(GC9A01A_WHITE);
+  display.print("ROBOT CONTROL SYSTEM INFORMATION");
+
+  display.drawFastVLine(400, 70, 290, GC9A01A_BLUE);
+
+  display.setTextSize(2);
+  display.setTextColor(GC9A01A_WHITE);
+  display.setCursor(30, 75);  display.print("LINK STATUS : ");
+  display.setCursor(30, 105); display.print("DRIVE MODE  : ");
+  display.setCursor(30, 135); display.print("PAN ANGLE  : ");
+  display.setCursor(30, 165); display.print("TILT ANGLE  : ");
+  
+  display.drawFastHLine(30, 195, 350, GC9A01A_BLUE);
+  display.setCursor(30, 210); display.print("GPS LAT : ");
+  display.setCursor(30, 240); display.print("GPS LON : ");
+  display.setCursor(30, 270); display.print("SATS/LCK: ");
+  display.setCursor(30, 300); display.print("COMPASS : ");
+  display.setCursor(30, 330); display.print("IMU ROLL: ");
+  display.setCursor(30, 355); display.print("IMU PCH : ");
+
+  display.setCursor(420, 75); display.print("PI 5 CMD   : ");
+  display.setCursor(420, 110); display.print("TRACKING   : ");
+  display.setCursor(420, 145); display.print("OBSTACLE SENSORS:");
+  display.setCursor(420, 180); display.print("FRONT: ");
+  display.setCursor(620, 180); display.print("BACK : ");
+  display.setCursor(420, 215); display.print("LEFT : ");
+  display.setCursor(620, 215); display.print("RIGHT: ");
+
+  display.drawRect(30, 380, 740, 65, GC9A01A_WHITE);
+  display.setCursor(50, 402);
+  display.setTextSize(2);
+  display.setTextColor(GC9A01A_WHITE);
+  display.print("UART STATUS : LISTENING FOR TELEMETRY...");
+}
+
+// DYNAMIC UI DRAWING ROUTINE
+void updateUI() {
+  display.setTextSize(2);
+  display.setCursor(200, 75);
+  if (isConnected) {
+    display.setTextColor(GC9A01A_GREEN, GC9A01A_BLACK);
+    display.print("CONNECTED   ");
+  } else {
+    display.setTextColor(GC9A01A_RED, GC9A01A_BLACK);
+    display.print("DISCONNECTED");
+  }
+
+  display.setCursor(200, 105);
+  if (currentDriveMode == 10) {
+    display.setTextColor(GC9A01A_GREEN, GC9A01A_BLACK);
+    display.print("MANUAL    ");
+  } else if (currentDriveMode == 11) {
+    display.setTextColor(GC9A01A_YELLOW, GC9A01A_BLACK);
+    display.print("AUTONOMOUS");
+  } else {
+    display.setTextColor(GC9A01A_RED, GC9A01A_BLACK);
+    display.print("UNKNOWN   ");
+  }
+
+  display.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+  display.setCursor(200, 135);
+  display.print(currentPanAngle); display.print(" deg   ");
+
+  display.setCursor(200, 165);
+  display.print(currentTiltAngle); display.print(" deg   ");
+
+  if (currentGPS.fix) {
+    display.setTextColor(GC9A01A_CYAN, GC9A01A_BLACK);
+    display.setCursor(150, 210); display.print(currentGPS.latitude, 6);  display.print("  ");
+    display.setCursor(150, 240); display.print(currentGPS.longitude, 6); display.print("  ");
+    display.setTextColor(GC9A01A_GREEN, GC9A01A_BLACK);
+    display.setCursor(150, 270); display.print(currentGPS.satellites); display.print(" (3D FIX) ");
+  } else {
+    display.setTextColor(GC9A01A_YELLOW, GC9A01A_BLACK);
+    display.setCursor(150, 210); display.print("SEARCHING...  ");
+    display.setCursor(150, 240); display.print("SEARCHING...  ");
+    display.setCursor(150, 270); display.print(gps.satellites.value()); display.print(" (NO LOCK)  ");
+  }
+
+  display.setTextColor(GC9A01A_MAGENTA, GC9A01A_BLACK);
+  display.setCursor(150, 300);
+  display.print(currentHeading); display.print(" deg   ");
+
+  display.setCursor(150, 330);
+  display.print(imuRoll, 1); display.print(" deg   ");
+
+  display.setCursor(150, 355);
+  display.print(imuPitch, 1); display.print(" deg   ");
+
+  display.setCursor(570, 75);
+  display.setTextColor(GC9A01A_CYAN, GC9A01A_BLACK);
+  display.print(piCommand);
+  for (size_t i = piCommand.length(); i < 12; i++) {
+    display.print(" ");
+  }
+  display.setCursor(570, 110);
+  display.setTextColor(GC9A01A_MAGENTA, GC9A01A_BLACK);
+  display.print(piStatus);
+  for (size_t i = piStatus.length(); i < 12; i++) {
+    display.print(" ");
+  }
+
+  display.setCursor(500, 180);
+  display.setTextColor(ObstacleFront ? GC9A01A_RED : GC9A01A_GREEN, GC9A01A_BLACK);
+  display.print(ObstacleFront ? "DETECTED " : "CLEAR    ");
+
+  display.setCursor(700, 180);
+  display.setTextColor(ObstacleBack ? GC9A01A_RED : GC9A01A_GREEN, GC9A01A_BLACK);
+  display.print(ObstacleBack ? "DETECTED " : "CLEAR    ");
+
+  display.setCursor(500, 215);
+  display.setTextColor(ObstacleLeft ? GC9A01A_RED : GC9A01A_GREEN, GC9A01A_BLACK);
+  display.print(ObstacleLeft ? "DETECTED " : "CLEAR    ");
+
+  display.setCursor(700, 215);
+  display.setTextColor(ObstacleRight ? GC9A01A_RED : GC9A01A_GREEN, GC9A01A_BLACK);
+  display.print(ObstacleRight ? "DETECTED " : "CLEAR    ");
+}
+
+// SENSORS & SERIAL PARSERS
+void parseGPS() {
+  while (Serial1.available() > 0) {
+    gps.encode(Serial1.read());
+  }
+  currentGPS.satellites = gps.satellites.value();
+  if (gps.location.isValid()) {
+    currentGPS.latitude = gps.location.lat();
+    currentGPS.longitude = gps.location.lng();
+    currentGPS.fix = true;
+  } else {
+    currentGPS.fix = false;
+  }
+}
+
+void parseCompass() {
+  if (millis() - lastCompassScan >= 100) { 
+    lastCompassScan = millis();
+    
+    int16_t x, y, z;
+    if (compass.getRawMagnetic(&x, &y, &z)) {
+      if (x != 0 || y != 0) {
+        float calcHeading = atan2((float)y, (float)x) * 180.0 / PI;
+        if (calcHeading < 0) calcHeading += 360.0;
+        currentHeading = (int)calcHeading;
+      }
+    }
+  }
+}
+
+void parseIMU() {
+  if (millis() - lastImuScan >= 50) { 
+    lastImuScan = millis();
+    Wire.beginTransmission(0x68);
+    Wire.write(0x3B);
+    byte writeErr = Wire.endTransmission(true);
+
+    if (writeErr == 0) {
+      byte bytesReceived = Wire.requestFrom(0x68, 6, true);
+      if (bytesReceived == 6) {
+        int16_t ax = (int16_t)(Wire.read() << 8 | Wire.read());
+        int16_t ay = (int16_t)(Wire.read() << 8 | Wire.read());
+        int16_t az = (int16_t)(Wire.read() << 8 | Wire.read());
+
+        imuRoll  = atan2(-ay, sqrt((long)ax * ax + (long)az * az)) * 180.0 / PI;
+        imuPitch = atan2(ax, sqrt((long)ay * ay + (long)az * az)) * 180.0 / PI;
+      }
+    }
+  }
+}
+
+void parsePiSerial() {
+  while (Serial.available() > 0) {
+    lastPiPacketReceived = millis();
+    isConnected = true;
+    uint8_t header = Serial.peek();
+
+    // --- USE HEADER BYTE TO DIFFERENTIATE THE MESSAGE RECEIVED FROM PI ---
+    if (header == 0xFF) {
+      Serial.read();
+      lastPiPacketReceived = millis();
+      piEmergencyStop = true;
+      piCommand = "EMERGENCY";
+      move_stop();
+    } 
+    else if (header == 0x01) {
+      Serial.read();
+      lastPiPacketReceived = millis();
+      piEmergencyStop = false;
+      stairApproachActive = false;
+      piStatus = "TRACKING";
+      piCommand = "TRACKING";
+      unsigned long startTime = millis();
+      while (Serial.available() < 2 && millis() - startTime < 200) {}
+      
+      if (Serial.available() >= 2) {
+        targetSteeringError = Serial.read() - 100;
+        targetBaseSpeed = Serial.read();
+      }
+    }
+    else if (header == 0x02) {
+      Serial.read();
+      lastPiPacketReceived = millis();
+      unsigned long startTime = millis();
+      while (Serial.available() < 4 && millis() - startTime < 200) {}
+      
+      if (Serial.available() >= 4) {
+        uint8_t rawPanByte = Serial.read();
+        uint8_t rawTiltByte = Serial.read();
+        uint8_t rawErrorByte = Serial.read();
+        uint8_t rawSpeedByte = Serial.read();
+
+        currentPanAngle = constrain(rawPanByte, 30, 240);
+        currentTiltAngle = constrain(rawTiltByte, 0, 180);
+        moveServo(panServo, currentPanAngle, 270);
+        moveServo(tiltServo, currentTiltAngle, 180);
+
+        piEmergencyStop = false;
+        stairApproachActive = false;
+        piStatus = "TRACKING";
+        piCommand = "TRACKING";
+        targetSteeringError = rawErrorByte - 100;
+        targetBaseSpeed = rawSpeedByte;
+      }
+    }
+
+    else if (header == 0x03) {
+      Serial.read();
+      lastPiPacketReceived = millis();
+      String textCmd = Serial.readStringUntil('\n');
+      textCmd.trim();
+      if (textCmd.length() > 0) {
+        lastPiPacketReceived = millis();
+        int colonIndex = textCmd.indexOf(':');
+        if (colonIndex != -1) {
+          String source = textCmd.substring(0, colonIndex);
+          String cmd = textCmd.substring(colonIndex + 1);
+          source.toUpperCase();
+          cmd.toUpperCase();
+          piCommand = cmd;
+          piStatus = source;
+        // --- STAIR MODE OVERRIDE LOGIC ---
+          if (cmd.indexOf("STAIRS_ALIGN") != -1 || cmd.indexOf("MODE:STAIRS") != -1) {
+            stairApproachActive = true; // Suppress front ultrasonic emergency stops
+          } else if (cmd.indexOf("MODE:NORMAL") != -1) {
+            stairApproachActive = false; // Re-enable standard collision checks
+          } else if (cmd == "FORWARD") move_forward();
+          else if (cmd == "BACKWARD") move_backward();
+          else if (cmd == "STOP") move_stop();
+          else if (cmd == "LEFT") move_left();
+          else if (cmd == "RIGHT") move_right();
+        }
+      }
+    }
+    else {
+      Serial.read();
+    }
+  }
+}
+
+// staircase climbing
+void executeStairApproachGait() {
+  unsigned long currentMillis = millis();
+  float progress = (float)(currentMillis - stairTimer) / (float)phaseDuration;
+
+  switch (stairPhase) {
+    case 0: // Phase 0: Compact Stance / Ready Position
+      {
+        // Smoothly move all legs to neutral stance (135, 90, 135) over 1000ms
+        int hip = smoothStep(135, 135, progress);
+        int femur = smoothStep(90, 90, progress);
+        int tibia = smoothStep(135, 135, progress);
+        for (int i = 0; i < 4; i++) {
+          setLegAngles(i, hip, femur, tibia);
+        }
+      }
+      if (progress >= 1.0) {
+        phaseDuration = 1200; // Give front lift a slower, more controlled duration
+        stairTimer = currentMillis;
+        stairPhase = 1;
+      }
+      break;
+      
+    case 1: // Phase 1: Lift Front Legs Smoothly
+      {
+        // Front legs (0, 1) lift up slowly
+        int flFemur = smoothStep(90, 135, progress);
+        int flTibia = smoothStep(135, 90, progress);
+        
+        setLegAngles(0, 135, flFemur, flTibia);
+        setLegAngles(1, 135, flFemur, flTibia);
+        
+        // Rear legs stay planted and shift weight backward
+        setLegAngles(2, 135, 90, 135);
+        setLegAngles(3, 135, 90, 135);
+      }
+      if (progress >= 1.0) {
+        phaseDuration = 1000;
+        stairTimer = currentMillis;
+        stairPhase = 2;
+      }
+      break;
+
+    case 2: // Phase 2: Plant Front Legs & Push Body Forward
+      {
+        int flFemur = smoothStep(135, 75, progress);
+        int flTibia = smoothStep(90, 120, progress);
+        
+        setLegAngles(0, 135, flFemur, flTibia);
+        setLegAngles(1, 135, flFemur, flTibia);
+      }
+      if (progress >= 1.0) {
+        phaseDuration = 1200;
+        stairTimer = currentMillis;
+        stairPhase = 3;
+      }
+      break;
+
+    case 3: // Phase 3: Lift Rear Legs to Clear Step Riser
+      {
+        int rlFemur = smoothStep(90, 135, progress);
+        int rlTibia = smoothStep(135, 90, progress);
+        
+        setLegAngles(2, 135, rlFemur, rlTibia);
+        setLegAngles(3, 135, rlFemur, rlTibia);
+      }
+      if (progress >= 1.0) {
+        phaseDuration = 1000;
+        stairTimer = currentMillis;
+        stairPhase = 0; // Loop back to stance
+      }
+      break;
+  }
+}
+
+// -------------------------------------------------------------
+// SETUP
+// -------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);   
+  Serial1.begin(9600);    
+
+
+  panServo.attach(Pan, 500, 2500);
+  tiltServo.attach(Tilt, 500, 2500);
+  moveServo(panServo, 135, 270);
+  moveServo(tiltServo, 90, 180);
+
+  Wire.begin();
+  Wire.setClock(100000); 
+  delay(200); 
+
+  setupPCA9685();
+  
+  // Initialize MPU6050
+  Wire.beginTransmission(0x68);
+  Wire.write(0x6B); Wire.write(0x00); Wire.endTransmission(true);
+  delay(50); 
+
+  // Initialize QMC5883P Compass using the library
+  if (!compass.begin()) {
+    Serial.println("Failed to find QMC5883P chip");
+  } else {
+    compass.setMode(QMC5883P_MODE_NORMAL);
+    compass.setODR(QMC5883P_ODR_50HZ);
+    compass.setOSR(QMC5883P_OSR_4);
+    compass.setRange(QMC5883P_RANGE_8G);
+  }
+
+  pinMode(R_EN, OUTPUT); pinMode(L_EN, OUTPUT);
+  pinMode(R_RPWM, OUTPUT); pinMode(R_LPWM, OUTPUT);
+  pinMode(L_RPWM, OUTPUT); pinMode(L_LPWM, OUTPUT);
+  pinMode(LED_INDICATOR, OUTPUT);
+
+  pinMode(TRIG_F, OUTPUT); pinMode(ECHO_F, INPUT);
+  pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
+  pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
+  pinMode(TRIG_B, OUTPUT); pinMode(ECHO_B, INPUT);
+
+  move_stop();
+
+  display.begin();
+  display.setRotation(1); 
+
+  setupUI();
+  updateUI();
+}
+
+// -------------------------------------------------------------
+// MAIN LOOP
+// -------------------------------------------------------------
+void loop() {
+  parsePiSerial();
+  parseGPS();
+  parseCompass();
+  parseIMU();
+
+  if (stairApproachActive) {
+    if (abs(imuPitch) > MAX_STAIR_PITCH) {
+      stairAborted = true;
+      stairApproachActive = false;
+      move_stop();
+      piCommand = "EMERGENCY_TILT";
+    }
+  }
+
+  if (stairAborted && abs(imuPitch) < 10.0) {
+    stairAborted = false; // Clear abort flag once level
+    piCommand = "IDLE";
+  }
+
+  if (millis() - lastFlaskGpsSend >= 1000) {
+    lastFlaskGpsSend = millis();
+    if (currentGPS.fix) {
+      Serial.print("G:");
+      Serial.print(currentGPS.latitude, 6);
+      Serial.print(",");
+      Serial.print(currentGPS.longitude, 6);
+      Serial.print(",");
+      Serial.print(currentHeading);
+      Serial.print(",");
+      Serial.print(imuRoll, 1);
+      Serial.print(",");
+      Serial.println(imuPitch, 1);
+    }
+  }
+
+  if (millis() - lastPiPacketReceived > LINK_TIMEOUT) {
+    if (isConnected) {
+      isConnected = false;
+      digitalWrite(LED_INDICATOR, LOW);      
+    }
+    if (piCommand != "IDLE" && piCommand != "DISCONNECTED") {
+      piCommand = "IDLE";
+      piStatus = "NONE";
+      move_stop();
+    }
+  } else {
+    digitalWrite(LED_INDICATOR, HIGH);
+  }
+
+  if (millis() - lastSensorScan >= 30) {
+    lastSensorScan = millis();
+    switch (sensorIndex) {
+      case 0: ObstacleFront = getSensorDistance(TRIG_F, ECHO_F); sensorIndex = 1; break;
+      case 1: ObstacleBack  = getSensorDistance(TRIG_B, ECHO_B); sensorIndex = 2; break;
+      case 2: ObstacleLeft  = getSensorDistance(TRIG_L, ECHO_L); sensorIndex = 3; break;
+      case 3: ObstacleRight = getSensorDistance(TRIG_R, ECHO_R); sensorIndex = 0; break;
+    }
+  }
+
+  if (currentDriveMode == 11) { 
+      // Only stop for front obstacles if we are NOT actively approaching stairs
+      if (piEmergencyStop || (ObstacleFront == 1 && !stairApproachActive)) {
+        move_stop();
+      }
+      else if (stairApproachActive || piCommand == "STAIRS_ALIGN") {
+        // Execute your advanced multi-phase stair climbing routine
+        executeStairApproachGait(); 
+      }
+      else if (piCommand == "TRACKING") {
+        int leftSpeed = constrain(targetBaseSpeed - targetSteeringError, -255, 255);
+        int rightSpeed = constrain(targetBaseSpeed + targetSteeringError, -255, 255);
+        TrackingSpeed(leftSpeed, rightSpeed);
+      } 
+      else if (piCommand == "FORWARD") {
+        move_forward();
+      }
+      else if (piCommand == "BACKWARD") {
+        move_backward();
+      }
+      else if (piCommand == "LEFT") {
+        move_left();
+      }
+      else if (piCommand == "RIGHT") {
+        move_right();
+      }
+      else if (piCommand == "STOP" || piCommand == "IDLE") {
+        move_stop();
+      }
+      else {
+        move_stop();
+      }
+    } else {
+      move_stop();
+    }
+  if (millis() - lastUIUpdate >= 200) {
+    lastUIUpdate = millis();
+    updateUI();
+  }
+}
