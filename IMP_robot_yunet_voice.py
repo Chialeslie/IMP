@@ -872,6 +872,9 @@ def main():
             self.pan_angle = 135
             self.tilt_angle = 90
 
+    PAN_MIN, PAN_MAX = 40, 220
+    TILT_MIN, TILT_MAX = 45, 105
+
     servo_tracker = DefaultServoTracker()
     last_snapshot_time = 0
     snapshot_cooldown = 2.0  
@@ -885,7 +888,7 @@ def main():
     current_frame_command = "STOP"
     current_source = "HOLD"
     last_serial_send_time = 0
-    SERIAL_SEND_INTERVAL = 0.25
+    SERIAL_SEND_INTERVAL = 0.033
     missing_target_count = 0
     MAX_MISSING_FRAMES = 5
     last_valid_target = None  # Explicitly initialized to prevent scope bugs
@@ -1139,21 +1142,59 @@ def main():
                     elif target_x_center is not None:
                         missing_target_count = 0  
                         
-                        steering_error = target_x_center - (FRAME_WIDTH // 2)
-                        servo_tracker.pan_angle -= steering_error * 0.05
-                        servo_tracker.pan_angle = max(0, min(270, servo_tracker.pan_angle))
+                        # EMA Smoothing Filter
+                        ALPHA = 0.2
+                        if not hasattr(servo_tracker, 'smoothed_x'):
+                            servo_tracker.smoothed_x = target_x_center
+                            servo_tracker.smoothed_y = int((target_bbox[1] + target_bbox[3]) / 2)
+
+                        servo_tracker.smoothed_x = (ALPHA * target_x_center) + ((1 - ALPHA) * servo_tracker.smoothed_x)
+                        raw_y_center = int((target_bbox[1] + target_bbox[3]) / 2)
+                        servo_tracker.smoothed_y = (ALPHA * raw_y_center) + ((1 - ALPHA) * servo_tracker.smoothed_y)
+
+                        # Calculate errors using smoothed center points
+                        steering_error = int(servo_tracker.smoothed_x - (FRAME_WIDTH // 2))
+                        vertical_error = int(servo_tracker.smoothed_y - (FRAME_HEIGHT // 2))
+
+                        DEADZONE_X = 30  # Pixels left/right of center (320)
+                        DEADZONE_Y = 30  # Pixels above/below center (240)
                         
-                        target_y_center = int((target_bbox[1] + target_bbox[3]) / 2)
-                        vertical_error = target_y_center - (FRAME_HEIGHT // 2)
-                        servo_tracker.tilt_angle -= vertical_error * 0.05
-                        servo_tracker.tilt_angle = max(30, min(120, servo_tracker.tilt_angle))
+                        if abs(steering_error) < DEADZONE_X:
+                            steering_error = 0
+                        if abs(vertical_error) < DEADZONE_Y:
+                            vertical_error = 0
                         
-                        base_speed = 150
+                        # --- PAN BOUNDARY & ANTI-WINDUP CHECK ---
+                        servo_tracker.pan_angle -= steering_error * 0.02
+                        if servo_tracker.pan_angle < PAN_MIN:
+                            servo_tracker.pan_angle = PAN_MIN
+                            steering_error = 0  # Stop error windup against physical stop
+                        elif servo_tracker.pan_angle > PAN_MAX:
+                            servo_tracker.pan_angle = PAN_MAX
+                            steering_error = 0
+
+                        # --- TILT BOUNDARY & ANTI-WINDUP CHECK ---
+                        servo_tracker.tilt_angle -= vertical_error * 0.02
+                        if servo_tracker.tilt_angle < TILT_MIN:
+                            servo_tracker.tilt_angle = TILT_MIN
+                            vertical_error = 0
+                        elif servo_tracker.tilt_angle > TILT_MAX:
+                            servo_tracker.tilt_angle = TILT_MAX
+                            vertical_error = 0
+                        
+                        # Dynamic speed scaling based on valid errors
+                        raw_speed = int(abs(steering_error) * 0.25 + abs(vertical_error) * 0.25)
+                        dynamic_speed = max(10, min(100, raw_speed)) if abs(steering_error) > 5 else 0
                         
                         current_time = time.time()
-                        if current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL:
+                        if current_time - last_serial_send_time >= 0.033:
                             try:
-                                motor.send_hybrid_tracking_command(servo_tracker.pan_angle, servo_tracker.tilt_angle, steering_error, base_speed)
+                                motor.send_hybrid_tracking_command(
+                                    servo_tracker.pan_angle, 
+                                    servo_tracker.tilt_angle, 
+                                    steering_error, 
+                                    dynamic_speed
+                                )
                                 last_serial_send_time = current_time
                             except Exception as e:
                                 print(f"[SERIAL WARNING]: Failed to send tracking command: {e}")
