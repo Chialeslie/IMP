@@ -49,16 +49,14 @@ def serial_reader_thread():
                     line = arduino.readline().decode('utf-8', errors='ignore').strip()
                     if line.startswith("G:"):
                         parts = line[2:].split(',')
-                        if len(parts) >= 2:
+                        if len(parts) >= 5:
                             current_lat = float(parts[0])
                             current_lon = float(parts[1])
-                            if len(parts) >= 3:
-                                current_heading = int(float(parts[2]))
-                            if len(parts) >= 4:
-                                current_roll = float(parts[3])
-                            if len(parts) >= 5:
-                                current_pitch = float(parts[4])
-                            last_gps_time = datetime.now().strftime("%H:%M:%S")
+                            current_heading = int(float(parts[2]))
+                            current_roll = float(parts[3])
+                            current_pitch = float(parts[4])
+                            if len(parts) >= 6:
+                                current_fix_status = int (parts[5])
             except Exception as e:
                 print(f"Serial read error: {e}")
                 arduino_connected = False
