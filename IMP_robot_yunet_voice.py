@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import os
+if os.getenv("INVOCATION_ID") or not os.getenv("DISPLAY"):
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
 import sys
 
 # --- Suppress Log Noise ---
@@ -1155,7 +1158,8 @@ def main():
                         # Calculate errors using smoothed center points
                         steering_error = int(servo_tracker.smoothed_x - (FRAME_WIDTH // 2))
                         vertical_error = int(servo_tracker.smoothed_y - (FRAME_HEIGHT // 2))
-
+                        
+                        # --- INCREASED DEADZONE FILTER ---
                         DEADZONE_X = 30  # Pixels left/right of center (320)
                         DEADZONE_Y = 30  # Pixels above/below center (240)
                         
@@ -1222,6 +1226,22 @@ def main():
                         
                     else:
                         missing_target_count += 1
+
+                        servo_tracker.pan_angle = 135
+                        servo_tracker.tilt_angle = 90
+                        current_time = time.time()
+                        if current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL:
+                            try:
+                                motor.send_hybrid_tracking_command(
+                                    servo_tracker.pan_angle,
+                                    servo_tracker.tilt_angle,
+                                    0,
+                                    0
+                                )
+                                last_serial_send_time = current_time
+                            except Exception as e:
+                                pass
+
                         if last_sent_command in ["FORWARD", "BACKWARD", "LEFT", "RIGHT"]:
                             current_frame_command = last_sent_command
                             current_source = "HOLD"
@@ -1243,7 +1263,7 @@ def main():
                 cv2.putText(cv2_display_frame, f"Cmd: {current_frame_command} ({current_source})", 
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
-                cv2.imshow("Robot Vision", cv2_display_frame)
+                #cv2.imshow("Robot Vision", cv2_display_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
