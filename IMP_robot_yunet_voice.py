@@ -325,24 +325,31 @@ class FaceDatabase:
         return "Unknown", "none", min_dist
     
 # -----------------------------------------------------------------------------
-# Skeleton-Based Fall Detector (Using Body Keypoints)
+# Fall Detection using MediaPipe Pose Landmarker using key body joints like shoulder
+# and hip combine with Multi-Criteria Geometric & Dynamic Rules
 # -----------------------------------------------------------------------------
 class PoseFallDetector:
-    def __init__(self, frame_height=FRAME_HEIGHT):
+    def __init__(self, frame_height=480, frame_width=640):
         self.frame_height = frame_height
+        self.frame_width = frame_width
+        
+        # State tracking variables for multi-criteria logic
+        self.prev_hip_y = None
+        self.prev_time = None
+        self.lying_start_time = None
         self.fall_detected = False
         self.fall_timestamp = 0
         self.cooldown_sec = 3.0
         
         # Initialize MediaPipe Pose Landmarker
-        pose_task_path = os.path.join(BASE_DIR, "pose_landmarker.task")
+        pose_task_path = os.path.join(BASE_DIR, "pose_landmarker.task") if 'BASE_DIR' in globals() else "pose_landmarker.task"
         if os.path.exists(pose_task_path):
             base_options = python.BaseOptions(model_asset_path=pose_task_path)
             options = vision.PoseLandmarkerOptions(
                 base_options=base_options,
                 num_poses=1,
-                min_pose_detection_confidence=0.2,
-                min_tracking_confidence=0.2
+                min_pose_detection_confidence=0.3,
+                min_tracking_confidence=0.3
             )
             self.pose_detector = vision.PoseLandmarker.create_from_options(options)
         else:
@@ -351,9 +358,8 @@ class PoseFallDetector:
 
     def process_crop_or_frame(self, frame, display_frame, bbox=None):
         current_time = time.time()
-        torso_angle = 90.0
-        is_fallen = False
         status_text = "NORMAL"
+        is_fallen = False
 
         if self.pose_detector:
             # Run pose detection on the full frame or cropped region safely
@@ -361,7 +367,7 @@ class PoseFallDetector:
                 xmin, ymin, xmax, ymax = bbox
                 # Ensure valid crop boundaries
                 xmin, ymin = max(0, xmin), max(0, ymin)
-                xmax, ymax = min(FRAME_WIDTH, xmax), min(FRAME_HEIGHT, ymax)
+                xmax, ymax = min(self.frame_width, xmax), min(self.frame_height, ymax)
                 person_roi = frame[ymin:ymax, xmin:xmax]
             else:
                 person_roi = frame
@@ -389,27 +395,64 @@ class PoseFallDetector:
                         hip_x = xmin + int(((left_hip.x + right_hip.x) / 2) * roi_w)
                         hip_y = ymin + int(((left_hip.y + right_hip.y) / 2) * roi_h)
 
-                        # Draw skeleton line on display frame
+                        # Draw skeleton lines on display frame
                         cv2.circle(display_frame, (shoulder_x, shoulder_y), 4, (0, 0, 255), -1)
                         cv2.circle(display_frame, (hip_x, hip_y), 4, (255, 0, 0), -1)
                         cv2.line(display_frame, (shoulder_x, shoulder_y), (hip_x, hip_y), (0, 255, 255), 2)
 
-                        # Compute torso angle relative to horizontal ground
+                        # --- RULE 1: Torso Angle Check ---
                         dx = hip_x - shoulder_x
                         dy = hip_y - shoulder_y
                         torso_angle = np.degrees(np.arctan2(abs(dy), abs(dx + 1e-6)))
+                        is_horizontal = torso_angle < 35.0
 
-                        # Fall condition: torso is nearly parallel to the floor (< 35 degrees)
-                        if torso_angle < 35.0:
-                            self.fall_detected = True
-                            self.fall_timestamp = current_time
+                        # --- RULE 2: Descent Velocity (Motion Dynamic) ---
+                        rapid_descent = False
+                        if self.prev_hip_y is not None and self.prev_time is not None:
+                            dt = current_time - self.prev_time
+                            if dt > 0:
+                                dy_hip = hip_y - self.prev_hip_y  # Positive means moving downwards in pixels
+                                velocity = dy_hip / dt            # Pixels per second
+                                if velocity > 180.0:              # Sudden drop threshold
+                                    rapid_descent = True
+                        
+                        self.prev_hip_y = hip_y
+                        self.prev_time = current_time
+
+                        # --- RULE 3: Bounding Box Aspect Ratio Check ---
+                        box_flat = False
+                        if bbox is not None:
+                            box_w = xmax - xmin
+                            box_h = ymax - ymin
+                            if box_w >= box_h * 0.9:
+                                box_flat = True
+
+                        # --- Multi-Criteria Logic Combination ---
+                        is_fall_candidate = is_horizontal and (rapid_descent or box_flat)
+
+                        if is_fall_candidate:
+                            if self.lying_start_time is None:
+                                self.lying_start_time = current_time
+                            
+                            # --- RULE 4: Prolonged Inactivity / Lying Duration ---
+                            lying_duration = current_time - self.lying_start_time
+                            if lying_duration >= 2.0:  # Must remain down for at least 2 seconds
+                                self.fall_detected = True
+                                self.fall_timestamp = current_time
+                                status_text = "FALL DETECTED!"
+                            else:
+                                status_text = f"CHECKING FALL ({lying_duration:.1f}s)..."
+                        else:
+                            # Reset timer if the person stands back up or moves normally
+                            self.lying_start_time = None
+
                 except Exception as e:
                     # Catch any MediaPipe runtime bounds error gracefully
                     pass
 
         # Check cooldown state
         if self.fall_detected:
-            if time.time() - self.fall_timestamp < self.cooldown_sec:
+            if current_time - self.fall_timestamp < self.cooldown_sec:
                 is_fallen = True
                 status_text = "FALL DETECTED!"
             else:
@@ -424,7 +467,6 @@ class PoseFallDetector:
             else:
                 self.fall_detected = False
         return False, "NORMAL"
-
 
 # -----------------------------------------------------------------------------
 # MediaPipe Hand Gesture Recognizer
@@ -920,6 +962,8 @@ def main():
                 if frame_count % 3 == 0:
                     current_terrain = terrain_classifier.analyze_surface(frame, display_frame)
                     is_fall, fall_status = pose_fall_detector.process_crop_or_frame(frame, display_frame, bbox=target_bbox)
+                    if is_fall and speaker:
+                        speaker.say("Warning! Fall detected! Requesting assistance.")
                 
                 gesture_cmd = None
                 if gesture_rec:
@@ -1054,6 +1098,9 @@ def main():
                     is_fall, fall_status = pose_fall_detector.process_crop_or_frame(frame, display_frame, bbox=target_bbox)
                     persisted_is_fall = is_fall
                     persisted_fall_status = fall_status
+                    if is_fall and speaker:
+                        speaker.say("Warning! Fall detected! Requesting assistance.")
+                        
                 elif frame_count > 0:
                     is_fall = locals().get('persisted_is_fall', False)
                     fall_status = locals().get('persisted_fall_status', "OK")
