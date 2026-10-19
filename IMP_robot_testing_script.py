@@ -738,22 +738,24 @@ class OfflineVoiceRecognizer:
                             time.sleep(0.5)
                             self.is_speaking = False
 
-                        # Match Commands
-                        if "forward" in text or "go" in text or " come here" in text:
+                        words = text.split()
+
+                        # Match Commands safely
+                        if any(w in words for w in ["forward", "come", "ahead"]):
                             register_cmd("FORWARD", "Moving forward.")
-                        elif "stop" in text or "halt" in text:
+                        elif any(w in words for w in ["stop", "halt", "wait"]):
                             register_cmd("STOP", "Stopping robot.")
-                        elif "back" in text or "backward" in text or "reverse" in text:
+                        elif any(w in words for w in ["back", "backward", "reverse", "retreat", "go"]):
                             register_cmd("BACKWARD", "Reversing.")
-                        elif "left" in text:
+                        elif "left" in words:
                             register_cmd("LEFT", "Turning left.")
-                        elif "right" in text:
+                        elif "right" in words:
                             register_cmd("RIGHT", "Turning right.")
-                        elif "auto" in text or "track" in text:
+                        elif any(w in words for w in ["auto", "track", "follow"]):
                             register_cmd("AUTO", "Resuming auto mode.")
-                        elif "eloy" in text:
+                        elif "eloy" in words:
                             register_cmd("ELOY", "Switching target to Eloy.")
-                        elif "chia" in text:
+                        elif "chia" in words:
                             register_cmd("CHIA", "Switching target to Chia.")
                         else:
                             register_cmd(text.upper(), f"Executing {text}.")
@@ -820,7 +822,7 @@ class MotorController:
 
         try:
             p_angle = pan_angle if pan_angle is not None else 135.0
-            t_angle = tilt_angle if tilt_angle is not None else 90.0
+            t_angle = tilt_angle if tilt_angle is not None else 85.0
             
             pan_scaled = max(30, min(240, int(float(p_angle))))
             tilt_byte = max(0, min(180, int(t_angle)))
@@ -828,7 +830,7 @@ class MotorController:
             err = steering_error if steering_error is not None else 0
             encoded_error = int(err) + 100
             encoded_error = max(0, min(255, encoded_error))
-            base_speed = max(0, min(200, int(base_speed)))
+            base_speed = max(0, min(255, int(base_speed)))
             
             # Single unified packet: [Header 0x02, Pan, Tilt, Steering Error, Speed]
             packet = bytes([0x02, pan_scaled, tilt_byte, encoded_error, base_speed])
@@ -915,7 +917,7 @@ def main():
     class DefaultServoTracker:
         def __init__(self):
             self.pan_angle = 135
-            self.tilt_angle = 90
+            self.tilt_angle = 85
 
     PAN_MIN, PAN_MAX = 40, 220
     TILT_MIN, TILT_MAX = 45, 105
@@ -940,6 +942,16 @@ def main():
     voice_override_expiry_time = 0
     VOICE_OVERRIDE_DURATION = 2.0
     current_terrain = "PAVEMENT"
+    # --- TARGET LOCK STATE VARIABLES ---
+    is_target_locked = False
+    locked_body_box = None
+    lock_timer = 0
+    LOCK_TIMEOUT = 5.0  # Seconds to keep tracking body if face is lost
+    # --- CLOTHING / APPEARANCE LOCK VARIABLES ---
+    target_clothing_hist = None
+    is_clothing_locked = False
+    CLOTHING_LOCK_TIMEOUT = 2.0
+    clothing_lock_timer = 0
 
     try:
         print("[DEBUG] Entering main loop now...")
@@ -977,7 +989,6 @@ def main():
 
                 detections = cam.parse_detections(metadata, CONFIDENCE_THRESHOLD, TARGET_CLASS_ID)
 
-                # --- Run YuNet Face & Landmark Detection ---
                 chosen_det = None
                 authorized_face_detected = False
                 faces = []
@@ -987,16 +998,12 @@ def main():
                     face_detector.setInputSize((FRAME_WIDTH, FRAME_HEIGHT))
                     _, faces = face_detector.detect(bgr_frame_for_yunet)
 
+                # 1. Face Recognition Phase (Establishes Clothing Lock)
                 if faces is not None and len(faces) > 0:
                     for face in faces:
                         fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
                         fx1, fy1, fx2, fy2 = max(0, fx), max(0, fy), min(FRAME_WIDTH, fx + fw), min(FRAME_HEIGHT, fy + fh)
                         
-                        landmarks = face[4:14].reshape((5, 2))
-                        landmark_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (0, 255, 255)]
-                        for idx, pt in enumerate(landmarks):
-                            cv2.circle(display_frame, (int(pt[0]), int(pt[1])), 3, landmark_colors[idx], -1)
-
                         person_crop = frame[fy1:fy2, fx1:fx2]
                         name = "Unknown"
                         role = "none"
@@ -1004,16 +1011,12 @@ def main():
                         if person_crop.size > 0 and hailo_embedder:
                             query_vector = hailo_embedder.get_embedding(person_crop)
                             name, role, dist = face_db.match_face(query_vector, max_distance=0.65)
-                            #print(f"[FACE DEBUG] Matched: {name} ({role}) | Distance: {dist:.4f}")
+                            
                             if name != "Unknown" and name is not None:
-                                if role.upper() == "VIP_FOLLOW":
+                                if role.upper() == "VIP_FOLLOW" or (target_name_override and name.lower() == target_name_override.lower()):
                                     authorized_face_detected = True
 
-                                current_time = time.time()
-                                if name not in last_greeted_times or (current_time - last_greeted_times[name]) > greeting_cooldown_seconds:
-                                    last_greeted_times[name] = current_time
-                                    speaker.say(f"Hello {name}. Welcome back.")
-
+                        # Find matching body box
                         matched_body_det = None
                         for det in detections:
                             bx1, by1, bx2, by2 = det["bbox"]
@@ -1021,18 +1024,58 @@ def main():
                                 matched_body_det = det
                                 break
 
-                        target_evaluation_det = matched_body_det if matched_body_det else {"bbox": [fx1, fy1, fx2, fy2], "confidence": face[14]}
-
-                        label = f"{name} ({role})"
-                        cv2.putText(display_frame, label, (fx1, max(20, fy1 - 10)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        cv2.rectangle(display_frame, (fx1, fy1), (fx2, fy2), (0, 0, 255), 2)
-
-                        if target_name_override and name.lower() == target_name_override.lower():
-                            chosen_det = target_evaluation_det
+                        if authorized_face_detected:
+                            chosen_det = matched_body_det if matched_body_det else {"bbox": [fx1, fy1, fx2, fy2], "confidence": face[14]}
+                            
+                            # --- CAPTURE CLOTHING SIGNATURE (TORSO REGION) ---
+                            bx1, by1, bx2, by2 = chosen_det["bbox"]
+                            # Estimate torso area (below the face down to mid-body)
+                            torso_ymin = int(by1 + (by2 - by1) * 0.2)
+                            torso_ymax = int(by1 + (by2 - by1) * 0.7)
+                            torso_crop = frame[max(0, torso_ymin):min(FRAME_HEIGHT, torso_ymax), max(0, bx1):min(FRAME_WIDTH, bx2)]
+                            
+                            if torso_crop.size > 0:
+                                hsv_torso = cv2.cvtColor(torso_crop, cv2.COLOR_RGB2HSV)
+                                # Calculate color histogram for Hue and Saturation
+                                target_clothing_hist = cv2.calcHist([hsv_torso], [0, 1], None, [32, 32], [0, 180, 0, 256])
+                                cv2.normalize(target_clothing_hist, target_clothing_hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+                                is_clothing_locked = True
+                                clothing_lock_timer = time.time()
+                            
                             break
-                        elif not target_name_override and role.upper() == target_role_to_follow.upper():
-                            chosen_det = target_evaluation_det
+
+                # 2. Face Lost Phase: Match via Clothing Histogram across Body Detections
+                if not chosen_det and is_clothing_locked and detections:
+                    if time.time() - clothing_lock_timer < CLOTHING_LOCK_TIMEOUT and target_clothing_hist is not None:
+                        best_match_det = None
+                        highest_score = -1.0
+
+                        for det in detections:
+                            bx1, by1, bx2, by2 = det["bbox"]
+                            torso_ymin = int(by1 + (by2 - by1) * 0.2)
+                            torso_ymax = int(by1 + (by2 - by1) * 0.7)
+                            candidate_torso = frame[max(0, torso_ymin):min(FRAME_HEIGHT, torso_ymax), max(0, bx1):min(FRAME_WIDTH, bx2)]
+                            
+                            if candidate_torso.size > 0:
+                                hsv_cand = cv2.cvtColor(candidate_torso, cv2.COLOR_RGB2HSV)
+                                cand_hist = cv2.calcHist([hsv_cand], [0, 1], None, [32, 32], [0, 180, 0, 256])
+                                cv2.normalize(cand_hist, cand_hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+                                
+                                # Compare histograms (CORRELATION method: 1.0 is a perfect match)
+                                score = cv2.compareHist(target_clothing_hist, cand_hist, 0)
+                                
+                                if score > highest_score and score > 0.75:  # Minimum similarity threshold
+                                    highest_score = score
+                                    best_match_det = det
+
+                        if best_match_det:
+                            chosen_det = best_match_det
+                            authorized_face_detected = True  # Keep tracking active
+                            cv2.putText(display_frame, f"LOCKED TO CLOTHING (Score: {highest_score:.2f})", (20, 120),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                    else:
+                        is_clothing_locked = False
+                        target_clothing_hist = None
 
                 # --- TARGET BUFFER & GRACE PERIOD LOGIC ---
                 if chosen_det is not None:
@@ -1193,7 +1236,7 @@ def main():
                         missing_target_count = 0  
                         
                         # EMA Smoothing Filter
-                        ALPHA = 0.2
+                        ALPHA = 0.4
                         if not hasattr(servo_tracker, 'smoothed_x'):
                             servo_tracker.smoothed_x = target_x_center
                             servo_tracker.smoothed_y = int((target_bbox[1] + target_bbox[3]) / 2)
@@ -1207,8 +1250,8 @@ def main():
                         vertical_error = int(servo_tracker.smoothed_y - (FRAME_HEIGHT // 2))
                         
                         # --- INCREASED DEADZONE FILTER ---
-                        DEADZONE_X = 30  # Pixels left/right of center (320)
-                        DEADZONE_Y = 30  # Pixels above/below center (240)
+                        DEADZONE_X = 20  # Pixels left/right of center (320)
+                        DEADZONE_Y = 20  # Pixels above/below center (240)
                         
                         if abs(steering_error) < DEADZONE_X:
                             steering_error = 0
@@ -1234,7 +1277,7 @@ def main():
                             vertical_error = 0
                         
                         # Dynamic speed scaling based on valid errors
-                        raw_speed = int(abs(steering_error) * 0.25 + abs(vertical_error) * 0.25)
+                        raw_speed = int(abs(steering_error) * 0.4 + abs(vertical_error) * 0.4)
                         dynamic_speed = max(10, min(100, raw_speed)) if abs(steering_error) > 5 else 0
                         
                         current_time = time.time()
