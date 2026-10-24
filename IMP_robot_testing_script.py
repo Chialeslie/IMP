@@ -489,9 +489,13 @@ class GestureRecognizer:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         results = self.detector.detect(mp_image)
         gesture_cmd = None  # Default to None so it doesn't force ghost values
+        hand_side = "Unknown"
 
         if results.hand_landmarks:
-            for hand_landmarks in results.hand_landmarks:
+            for idx, hand_landmarks in enumerate(results.hand_landmarks):
+                if results.handedness and len(results.handedness) > idx:
+                    hand_side = results.handedness[idx][0].category_name
+
                 lm = hand_landmarks
 
                 for connection in HAND_CONNECTIONS:
@@ -507,7 +511,7 @@ class GestureRecognizer:
                 thumb_index_dist = ((lm[4].x - lm[8].x)**2 + (lm[4].y - lm[8].y)**2)**0.5
                 wrist_y = lm[0].y
 
-                print(f"[GESTURE DEBUG] Wrist Y: {wrist_y:.2f} | Index Up: {lm[8].y < lm[6].y}")
+                print(f"[GESTURE DEBUG] Hand: {hand_side} | Wrist Y: {wrist_y:.2f} | Index Up: {lm[8].y < lm[6].y}")
                 print(f"[DEBUG GESTURE] index_open: {index_open} | middle_open: {middle_open} | ring_open: {ring_open} | pinky_open: {pinky_open}")
 
                 # ONLY evaluate gestures if the hand is raised above 0.50 height gate
@@ -539,7 +543,7 @@ class GestureRecognizer:
                         gesture_cmd = "STOP"
                         break
 
-        return gesture_cmd
+        return gesture_cmd, hand_side
 
 # -----------------------------------------------------------------------------
 # Offline Voice Recognizer (Vosk + PyAudio)
@@ -994,9 +998,16 @@ def main():
                         speaker.say("Warning! Fall detected! Requesting assistance.")
                 
                 gesture_cmd = None
+                hand_side = "Unknown"
+
                 if gesture_rec:
                     if frame_count % 5 == 0:
-                        gesture_cmd = gesture_rec.process_frame(frame, display_frame)
+                        result = gesture_rec.process_frame(frame, display_frame)
+                        if isinstance(result, tuple):
+                            gesture_cmd, hand_side = result
+                        else:
+                            gesture_cmd = result
+
                         if gesture_cmd:
                             persisted_gesture = gesture_cmd
                     else:
@@ -1019,17 +1030,7 @@ def main():
                     for face in faces:
                         fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
                         fx1, fy1, fx2, fy2 = max(0, fx), max(0, fy), min(FRAME_WIDTH, fx + fw), min(FRAME_HEIGHT, fy + fh)
-
-                        cv2.rectangle(display_frame, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
-
-                        landmarks = [
-                            (int(face[4]), int(face[5])),
-                            (int(face[6]), int(face[7])),
-                            (int(face[8]), int(face[9])),
-                            (int(face[10]), int(face[11])),
-                            (int(face[12]), int(face[13]))
-                        ]
-                        
+                 
                         person_crop = frame[fy1:fy2, fx1:fx2]
                         name = "Unknown"
                         role = "none"
@@ -1199,7 +1200,7 @@ def main():
                             pass
 
                 if gesture_cmd:
-                    cv2.putText(display_frame, f"GESTURE: {gesture_cmd}", (20, 50),
+                    cv2.putText(display_frame, f"GESTURE: {gesture_cmd} ({hand_side})", (20, 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 else:
                     cv2.putText(display_frame, "GESTURE: NONE", (20, 50),
@@ -1345,53 +1346,51 @@ def main():
                                 
                         is_tracking_active = True
                         current_source = "TRACKING"
-                        cv2.putText(display_frame, f"TRACKING TARGET (Err X:{steering_error} Y:{vertical_error})", (20, 90),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                        xmin, ymin, xmax, ymax = target_bbox
+                        box_height = ymax - ymin
+                        
+                        IDEAL_BOX_HEIGHT = 300  # Adjust this based on your preferred distance (in pixels)
+                        HEIGHT_TOLERANCE = 40   # Deadzone buffer so the robot doesn't jitter back and forth
+                        
+                        if box_height < (IDEAL_BOX_HEIGHT - HEIGHT_TOLERANCE):
+                            current_frame_command = "FORWARD"
+                            current_source = "TRACKING_DISTANCE"
+                        elif box_height > (IDEAL_BOX_HEIGHT + HEIGHT_TOLERANCE):
+                            current_frame_command = "BACKWARD"
+                            current_source = "TRACKING_DISTANCE"
+                        else:
+                            current_frame_command = "STOP"
+                            current_source = "TRACKING_DISTANCE"      
+
+                        cv2.putText(display_frame, "TRACKING (Holding target loss...)", (20, 90),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
                         
                     else:
-                        # Increment target loss counter once per frame here
-                        missing_target_count += 1
-                        
-                        if missing_target_count < MAX_MISSING_FRAMES and current_source == "TRACKING":
-                            is_tracking_active = True
-                            current_source = "TRACKING"
+                        # --- RETURN TO HOME POSITION ---
+                        servo_tracker.pan_angle = 135
+                        servo_tracker.tilt_angle = 95
+                        is_tracking_active = False
+                        current_source = "HOLD"
                             
-                            current_time = time.time()
-                            if current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL:
-                                try:
-                                    # Hold last known position smoothly
-                                    motor.send_hybrid_tracking_command(servo_tracker.pan_angle, servo_tracker.tilt_angle, 0, 0)
-                                    last_serial_send_time = current_time
-                                except Exception as e:
-                                    pass
-
-                            cv2.putText(display_frame, "TRACKING (Holding target loss...)", (20, 90),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
-                        else:
-                            # --- RETURN TO HOME POSITION ---
-                            servo_tracker.pan_angle = 135
-                            servo_tracker.tilt_angle = 95
-                            is_tracking_active = False
-                            current_source = "HOLD"
-                            
-                            current_time = time.time()
-                            if current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL:
-                                try:
+                        current_time = time.time()
+                        if current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL:
+                            try:
                                     # Force error to 0 and speed to high/moderate so servos sweep back home
-                                    motor.send_hybrid_tracking_command(
-                                        servo_tracker.pan_angle,
-                                        servo_tracker.tilt_angle,
-                                        0,   # Zero error forces packet parser to center cleanly
-                                        50   # Safe homing speed
-                                    )
-                                    last_serial_send_time = current_time
-                                except Exception as e:
-                                    pass
+                                motor.send_hybrid_tracking_command(
+                                    servo_tracker.pan_angle,
+                                    servo_tracker.tilt_angle,
+                                    0,   # Zero error forces packet parser to center cleanly
+                                    50   # Safe homing speed
+                                )
+                                last_serial_send_time = current_time
+                            except Exception as e:
+                                pass
 
-                            cv2.putText(display_frame, "STATUS: TARGET LOST - RETURNING HOME", (20, 90),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)                    
+                        cv2.putText(display_frame, "STATUS: TARGET LOST - RETURNING HOME", (20, 90),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)                    
 
-                if not is_tracking_active and current_frame_command:
+                if current_frame_command:
                     if current_frame_command != last_sent_command or (time.time() - last_send_time) > 0.5:
                         motor.send_command(current_source, current_frame_command)
                         last_sent_command = current_frame_command
