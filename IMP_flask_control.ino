@@ -54,6 +54,7 @@ const int L_EN = 27;
 const int L_RPWM = 6;   
 const int L_LPWM = 7;   
 const int LED_INDICATOR = 31;
+const int BUZZER_PIN = 40;
 
 const int TRIG_F = 22, ECHO_F = 24;
 const int TRIG_L = 26, ECHO_L = 28;
@@ -67,7 +68,7 @@ int ObstacleBack  = 0;
 uint8_t sensorIndex = 0; 
 
 int currentPanAngle = 135;
-int currentTiltAngle = 90;
+int currentTiltAngle = 95;
 int16_t x_offset = 0; 
 int16_t y_offset = 0;
 unsigned long lastSensorScan = 0;
@@ -79,6 +80,7 @@ int fixStatus = 0;
 unsigned long lastImuScan = 0;
 const unsigned long LINK_TIMEOUT = 2000;
 bool isConnected = false;
+String uartStatusMessage = "LISTENING FOR TELEMETRY...";
 
 // Autonomous State Variables
 String piCommand = "IDLE";
@@ -285,6 +287,13 @@ void updateUI() {
   display.setCursor(700, 215);
   display.setTextColor(ObstacleRight ? GC9A01A_RED : GC9A01A_GREEN, GC9A01A_BLACK);
   display.print(ObstacleRight ? "DETECTED " : "CLEAR    ");
+
+  display.fillRect(45, 400, 715, 30, GC9A01A_BLACK);
+  display.setCursor(50, 402);
+  display.setTextSize(2);
+  display.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+  display.print("UART STATUS: ");
+  display.print(uartStatusMessage);
 }
 
 // SENSORS & SERIAL PARSERS
@@ -359,6 +368,7 @@ void parsePiSerial() {
       lastPiPacketReceived = millis();
       piEmergencyStop = true;
       piCommand = "EMERGENCY";
+      uartStatusMessage = "PKT: 0xFF (Emergency Stop)";
       move_stop();
     } 
     else if (header == 0x01) {
@@ -367,6 +377,7 @@ void parsePiSerial() {
       piEmergencyStop = false;
       piStatus = "TRACKING";
       piCommand = "TRACKING";
+      uartStatusMessage = "PKT: 0x01 (Tracking Data)";
       unsigned long startTime = millis();
       while (Serial.available() < 2 && millis() - startTime < 200) {}
       
@@ -378,6 +389,7 @@ void parsePiSerial() {
     else if (header == 0x02) {
       Serial.read();
       lastPiPacketReceived = millis();
+      uartStatusMessage = "PKT: 0x02 (Pan/Tilt + Track)";
       unsigned long startTime = millis();
       while (Serial.available() < 4 && millis() - startTime < 200) {}
       
@@ -402,9 +414,26 @@ void parsePiSerial() {
 
     else if (header == 0x03) {
       Serial.read();
+      uartStatusMessage = "PKT: 0x03 (Text Cmd)";
       String textCmd = Serial.readStringUntil('\n');
       textCmd.trim();
       processTextCommand(textCmd);
+    }
+
+    else if (header == 0x04) {
+      Serial.read();
+      lastPiPacketReceived = millis();
+      uartStatusMessage = "PKT: 0x04 (Fall Detected)";
+      digitalWrite(BUZZER_PIN, HIGH); // Turn buzzer ON
+      piCommand = "ALARM";
+      piStatus = "BUZZER_ACTIVE";
+    }
+
+    else if (header == 0x05) {
+      Serial.read();
+      lastPiPacketReceived = millis();
+      uartStatusMessage = "PKT: 0x05 (Fall Cleared)";
+      digitalWrite(BUZZER_PIN, LOW); // Turn buzzer OFF
     }
     else {
       String textCmd = Serial.readStringUntil('\n');
@@ -491,11 +520,10 @@ void setup() {
   Serial.begin(115200);   
   Serial1.begin(9600);    
 
-
   panServo.attach(Pan, 500, 2500);
   tiltServo.attach(Tilt, 500, 2500);
   moveServo(panServo, 135, 270);
-  moveServo(tiltServo, 90, 180);
+  moveServo(tiltServo, 95, 180);
 
   Wire.begin();
   Wire.setClock(100000); 
@@ -525,6 +553,8 @@ void setup() {
   pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
   pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
   pinMode(TRIG_B, OUTPUT); pinMode(ECHO_B, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
 
   move_stop();
 
