@@ -917,7 +917,7 @@ def main():
     class DefaultServoTracker:
         def __init__(self):
             self.pan_angle = 135
-            self.tilt_angle = 85
+            self.tilt_angle = 95
 
     PAN_MIN, PAN_MAX = 40, 220
     TILT_MIN, TILT_MAX = 45, 105
@@ -1003,6 +1003,16 @@ def main():
                     for face in faces:
                         fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
                         fx1, fy1, fx2, fy2 = max(0, fx), max(0, fy), min(FRAME_WIDTH, fx + fw), min(FRAME_HEIGHT, fy + fh)
+
+                        cv2.rectangle(display_frame, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
+
+                        landmarks = [
+                            (int(face[4]), int(face[5])),
+                            (int(face[6]), int(face[7])),
+                            (int(face[8]), int(face[9])),
+                            (int(face[10]), int(face[11])),
+                            (int(face[12]), int(face[13]))
+                        ]
                         
                         person_crop = frame[fy1:fy2, fx1:fx2]
                         name = "Unknown"
@@ -1015,6 +1025,12 @@ def main():
                             if name != "Unknown" and name is not None:
                                 if role.upper() == "VIP_FOLLOW" or (target_name_override and name.lower() == target_name_override.lower()):
                                     authorized_face_detected = True
+
+                                current_time = time.time()
+                                if name not in last_greeted_times or (current_time - last_greeted_times[name] > greeting_cooldown_seconds):
+                                    if speaker:
+                                        speaker.say(f"Hello {name}. Welcome back.")
+                                    last_greeted_times[name] = current_time
 
                         # Find matching body box
                         matched_body_det = None
@@ -1318,7 +1334,7 @@ def main():
                         missing_target_count += 1
 
                         servo_tracker.pan_angle = 135
-                        servo_tracker.tilt_angle = 90
+                        servo_tracker.tilt_angle = 95
                         current_time = time.time()
                         if current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL:
                             try:
