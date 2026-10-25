@@ -489,9 +489,13 @@ class GestureRecognizer:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         results = self.detector.detect(mp_image)
         gesture_cmd = None  # Default to None so it doesn't force ghost values
+        hand_side = "Unknown"
 
         if results.hand_landmarks:
-            for hand_landmarks in results.hand_landmarks:
+            for idx, hand_landmarks in enumerate(results.hand_landmarks):
+                if results.handedness and len(results.handedness) > idx:
+                    hand_side = results.handedness[idx][0].category_name
+
                 lm = hand_landmarks
 
                 for connection in HAND_CONNECTIONS:
@@ -507,7 +511,7 @@ class GestureRecognizer:
                 thumb_index_dist = ((lm[4].x - lm[8].x)**2 + (lm[4].y - lm[8].y)**2)**0.5
                 wrist_y = lm[0].y
 
-                print(f"[GESTURE DEBUG] Wrist Y: {wrist_y:.2f} | Index Up: {lm[8].y < lm[6].y}")
+                print(f"[GESTURE DEBUG] Hand: {hand_side} | Wrist Y: {wrist_y:.2f} | Index Up: {lm[8].y < lm[6].y}")
                 print(f"[DEBUG GESTURE] index_open: {index_open} | middle_open: {middle_open} | ring_open: {ring_open} | pinky_open: {pinky_open}")
 
                 # ONLY evaluate gestures if the hand is raised above 0.50 height gate
@@ -539,7 +543,7 @@ class GestureRecognizer:
                         gesture_cmd = "STOP"
                         break
 
-        return gesture_cmd
+        return gesture_cmd, hand_side
 
 # -----------------------------------------------------------------------------
 # Offline Voice Recognizer (Vosk + PyAudio)
@@ -844,6 +848,20 @@ class MotorController:
         except Exception as e:
             print(f"[WARNING] Failed to send hybrid tracking command over serial: {e}")
 
+    def send_buzzer_command(self, statu=True):
+        if self.ser is None or not self.ser.is_open:
+            return
+        try:
+            header_byte = 0x04 if state else 0x05
+            packet = bytes(header_byte)
+            print(f"[SERIAL OUT] Buzzer State: {'ON' if state else 'OFF'} | Hex Bytes: {packet.hex()}")
+            self.ser.write(packet)
+        except serial.SerialTimeoutException:
+            pass
+        except Exception as e:
+            print(f"[WARNING] Failed to send buzzer command over serial: {e}")
+            self.ser = None
+
 # -----------------------------------------------------------------------------
 # Main Application Loop
 # -----------------------------------------------------------------------------
@@ -917,7 +935,7 @@ def main():
     class DefaultServoTracker:
         def __init__(self):
             self.pan_angle = 135
-            self.tilt_angle = 95
+            self.tilt_angle = 85
 
     PAN_MIN, PAN_MAX = 40, 220
     TILT_MIN, TILT_MAX = 45, 105
@@ -952,6 +970,8 @@ def main():
     is_clothing_locked = False
     CLOTHING_LOCK_TIMEOUT = 2.0
     clothing_lock_timer = 0
+    buzzer_triggered = False
+    current_tracked_name = "Unknown"
 
     try:
         print("[DEBUG] Entering main loop now...")
@@ -978,14 +998,37 @@ def main():
                         speaker.say("Warning! Fall detected! Requesting assistance.")
                 
                 gesture_cmd = None
+                hand_side = "Unknown"
+
                 if gesture_rec:
                     if frame_count % 5 == 0:
-                        gesture_cmd = gesture_rec.process_frame(frame, display_frame)
-                        if gesture_cmd:
-                            persisted_gesture = gesture_cmd
-                    else:
-                        if time.time() - last_gesture_time < 1.5:
+                        raw_result = gesture_rec.process_frame(frame, display_frame)
+                        if isinstance(raw_result, tuple):
+                            raw_cmd, hand_side = raw_result
+                        else:
+                            raw_cmd = raw_result
+
+                        if raw_cmd:
+                            # If you make a new gesture, update it instantly!
+                            if raw_cmd != persisted_gesture:
+                                persisted_gesture = raw_cmd
+                                print(f"[GESTURE] Detected new gesture: {raw_cmd}")
+                            
                             gesture_cmd = persisted_gesture
+                            last_gesture_time = time.time()  # Refresh activity timer
+                        else:
+                            # Grace period (0.5s) on missed frames so it doesn't flicker
+                            if time.time() - last_gesture_time < 0.5:
+                                gesture_cmd = persisted_gesture
+                            else:
+                                gesture_cmd = None
+                                persisted_gesture = "STOP"
+                    else:
+                        # Carry over gesture smoothly on skipped frames
+                        if time.time() - last_gesture_time < 0.5:
+                            gesture_cmd = persisted_gesture
+                        else:
+                            gesture_cmd = None
 
                 detections = cam.parse_detections(metadata, CONFIDENCE_THRESHOLD, TARGET_CLASS_ID)
 
@@ -1003,17 +1046,7 @@ def main():
                     for face in faces:
                         fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
                         fx1, fy1, fx2, fy2 = max(0, fx), max(0, fy), min(FRAME_WIDTH, fx + fw), min(FRAME_HEIGHT, fy + fh)
-
-                        cv2.rectangle(display_frame, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
-
-                        landmarks = [
-                            (int(face[4]), int(face[5])),
-                            (int(face[6]), int(face[7])),
-                            (int(face[8]), int(face[9])),
-                            (int(face[10]), int(face[11])),
-                            (int(face[12]), int(face[13]))
-                        ]
-                        
+                 
                         person_crop = frame[fy1:fy2, fx1:fx2]
                         name = "Unknown"
                         role = "none"
@@ -1023,6 +1056,7 @@ def main():
                             name, role, dist = face_db.match_face(query_vector, max_distance=0.65)
                             
                             if name != "Unknown" and name is not None:
+                                current_tracked_name = name
                                 if role.upper() == "VIP_FOLLOW" or (target_name_override and name.lower() == target_name_override.lower()):
                                     authorized_face_detected = True
 
@@ -1030,7 +1064,7 @@ def main():
                                 if name not in last_greeted_times or (current_time - last_greeted_times[name] > greeting_cooldown_seconds):
                                     if speaker:
                                         speaker.say(f"Hello {name}. Welcome back.")
-                                    last_greeted_times[name] = current_time
+                                    last_greeted_times[name] = current_time                
 
                         # Find matching body box
                         matched_body_det = None
@@ -1145,7 +1179,7 @@ def main():
                     target_x_center = int((xmin + xmax) / 2)
                     
                     cv2.rectangle(display_frame, (xmin, ymin), (xmax, ymax), (255, 255, 0), 3)
-                    cv2.putText(display_frame, f"TRACKING TARGET [{target_name_override or target_role_to_follow}]", (xmin, max(40, ymin - 30)),
+                    cv2.putText(display_frame, f"TRACKING: {current_tracked_name.upper()} [{target_role_to_follow}]", (xmin, max(40, ymin - 30)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
                 cv2.line(display_frame, (FRAME_WIDTH // 2, 0), (FRAME_WIDTH // 2, FRAME_HEIGHT), (100, 100, 100), 1)
@@ -1164,8 +1198,25 @@ def main():
                     is_fall = locals().get('persisted_is_fall', False)
                     fall_status = locals().get('persisted_fall_status', "OK")
 
+                if is_fall:
+                    if not buzzer_triggered:
+                        try:
+                            motor.send_buzzer_command(state=True)
+                            buzzer_triggered = True
+                            print("[ALARM] Fall detected! Sent buzzer trigger to Arduino")
+                        except Exception as e:
+                            print(f"[ERROR] Could not send buzzer command: {e}")
+                else:
+                    if buzzer_triggered:
+                        try:
+                            motor.send_buzzer_command(statu=False)
+                            buzzer_triggered = False
+                            print("[INFO] Fall cleared. Buzzer turned off.")
+                        except Exception as e:
+                            pass
+
                 if gesture_cmd:
-                    cv2.putText(display_frame, f"GESTURE: {gesture_cmd}", (20, 50),
+                    cv2.putText(display_frame, f"GESTURE: {gesture_cmd} ({hand_side})", (20, 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 else:
                     cv2.putText(display_frame, "GESTURE: NONE", (20, 50),
@@ -1180,7 +1231,7 @@ def main():
                     cv2.putText(display_frame, f"ALARM: {fall_status}", (20, 140),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
                     current_frame_command = "STOP"
-                    current_source = "HOLD"
+                    current_source = "HOLD"                   
 
                 elif current_terrain == "STAIRCASE":
                     current_frame_command = "STOP"
@@ -1198,8 +1249,8 @@ def main():
                         manual_voice_override = None
 
                     if authorized_face_detected and gesture_cmd and gesture_cmd in ["FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"]:
-                        persisted_gesture = gesture_cmd
-                        last_gesture_time = time.time()
+                        # persisted_gesture = gesture_cmd
+                        # last_gesture_time = time.time()
                         current_frame_command = gesture_cmd
                         current_source = "GESTURE"
 
@@ -1248,8 +1299,9 @@ def main():
                         cv2.putText(display_frame, f"GESTURE CMD: TAKE_PHOTO", (20, 90),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
                                                                   
+                    
                     elif target_x_center is not None:
-                        missing_target_count = 0  
+                        missing_target_count = 0  # Reset counter on valid target
                         
                         # EMA Smoothing Filter
                         ALPHA = 0.4
@@ -1266,8 +1318,8 @@ def main():
                         vertical_error = int(servo_tracker.smoothed_y - (FRAME_HEIGHT // 2))
                         
                         # --- INCREASED DEADZONE FILTER ---
-                        DEADZONE_X = 20  # Pixels left/right of center (320)
-                        DEADZONE_Y = 20  # Pixels above/below center (240)
+                        DEADZONE_X = 20
+                        DEADZONE_Y = 20
                         
                         if abs(steering_error) < DEADZONE_X:
                             steering_error = 0
@@ -1278,7 +1330,7 @@ def main():
                         servo_tracker.pan_angle -= steering_error * 0.02
                         if servo_tracker.pan_angle < PAN_MIN:
                             servo_tracker.pan_angle = PAN_MIN
-                            steering_error = 0  # Stop error windup against physical stop
+                            steering_error = 0
                         elif servo_tracker.pan_angle > PAN_MAX:
                             servo_tracker.pan_angle = PAN_MAX
                             steering_error = 0
@@ -1292,7 +1344,6 @@ def main():
                             servo_tracker.tilt_angle = TILT_MAX
                             vertical_error = 0
                         
-                        # Dynamic speed scaling based on valid errors
                         raw_speed = int(abs(steering_error) * 0.4 + abs(vertical_error) * 0.4)
                         dynamic_speed = max(10, min(100, raw_speed)) if abs(steering_error) > 5 else 0
                         
@@ -1311,55 +1362,51 @@ def main():
                                 
                         is_tracking_active = True
                         current_source = "TRACKING"
-                        cv2.putText(display_frame, f"TRACKING TARGET (Err X:{steering_error} Y:{vertical_error})", (20, 90),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                        xmin, ymin, xmax, ymax = target_bbox
+                        box_height = ymax - ymin
                         
-                    elif missing_target_count < MAX_MISSING_FRAMES and current_source == "TRACKING":
-                        missing_target_count += 1
-                        is_tracking_active = True
-                        current_source = "TRACKING"
+                        IDEAL_BOX_HEIGHT = 300  # Adjust this based on your preferred distance (in pixels)
+                        HEIGHT_TOLERANCE = 40   # Deadzone buffer so the robot doesn't jitter back and forth
                         
-                        current_time = time.time()
-                        if current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL:
-                            try:
-                                motor.send_hybrid_tracking_command(servo_tracker.pan_angle, servo_tracker.tilt_angle, 0, 150)
-                                last_serial_send_time = current_time
-                            except Exception as e:
-                                pass
+                        if box_height < (IDEAL_BOX_HEIGHT - HEIGHT_TOLERANCE):
+                            current_frame_command = "FORWARD"
+                            current_source = "TRACKING_DISTANCE"
+                        elif box_height > (IDEAL_BOX_HEIGHT + HEIGHT_TOLERANCE):
+                            current_frame_command = "BACKWARD"
+                            current_source = "TRACKING_DISTANCE"
+                        else:
+                            current_frame_command = "STOP"
+                            current_source = "TRACKING_DISTANCE"      
 
                         cv2.putText(display_frame, "TRACKING (Holding target loss...)", (20, 90),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
                         
                     else:
-                        missing_target_count += 1
-
+                        # --- RETURN TO HOME POSITION ---
                         servo_tracker.pan_angle = 135
                         servo_tracker.tilt_angle = 95
+                        is_tracking_active = False
+                        current_source = "HOLD"
+                            
                         current_time = time.time()
                         if current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL:
                             try:
+                                    # Force error to 0 and speed to high/moderate so servos sweep back home
                                 motor.send_hybrid_tracking_command(
                                     servo_tracker.pan_angle,
                                     servo_tracker.tilt_angle,
-                                    0,
-                                    0
+                                    0,   # Zero error forces packet parser to center cleanly
+                                    50   # Safe homing speed
                                 )
                                 last_serial_send_time = current_time
                             except Exception as e:
                                 pass
 
-                        if last_sent_command in ["FORWARD", "BACKWARD", "LEFT", "RIGHT"]:
-                            current_frame_command = last_sent_command
-                            current_source = "HOLD"
-                            cv2.putText(display_frame, f"HOLDING CMD: {current_frame_command}", (20, 90),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
-                        else:
-                            current_frame_command = "STOP"
-                            current_source = "HOLD"
-                            cv2.putText(display_frame, "STATUS: IDLE / STOPPED", (20, 90),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                        cv2.putText(display_frame, "STATUS: TARGET LOST - RETURNING HOME", (20, 90),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)                    
 
-                if not is_tracking_active and current_frame_command:
+                if current_frame_command:
                     if current_frame_command != last_sent_command or (time.time() - last_send_time) > 0.5:
                         motor.send_command(current_source, current_frame_command)
                         last_sent_command = current_frame_command
@@ -1369,7 +1416,7 @@ def main():
                 cv2.putText(cv2_display_frame, f"Cmd: {current_frame_command} ({current_source})", 
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
-                #cv2.imshow("Robot Vision", cv2_display_frame)
+                cv2.imshow("Robot Vision", cv2_display_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
