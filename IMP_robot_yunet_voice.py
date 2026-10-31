@@ -776,20 +776,74 @@ class OfflineVoiceRecognizer:
             import traceback
             traceback.print_exc()
 
+# ---------------------------------------------------------------
+# PID steering control
+# ---------------------------------------------------------------
+class PIDController:
+    def __init__(self, kp, ki, kd, output_limits=(-78, 78), alpha=0.4):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.min_output, self.max_output = output_limits
+        self.alpha = alpha  # Low-pass filter smoothing factor (0.0 to 1.0)
+        
+        self.integral = 0.0
+        self.previous_error = 0.0
+        self.filtered_derivative = 0.0
+        self.filtered_output = 0.0
+        self.last_time = time.time()
+
+    def compute(self, error):
+        now = time.time()
+        dt = now - self.last_time
+        if dt <= 0.0:
+            dt = 0.001  # Prevent division by zero on rapid loops
+            
+        # 1. Proportional term
+        p = self.kp * error
+        
+        # 2. Integral term with dynamic anti-windup clamping
+        self.integral += error * dt
+        if self.ki != 0:
+            i_limit = (self.max_output - self.min_output) / abs(self.ki)
+            self.integral = max(-i_limit, min(i_limit, self.integral))
+        i = self.ki * self.integral
+        
+        # 3. Derivative term with Low-Pass Filtering (eliminates sensor noise spikes)
+        raw_derivative = (error - self.previous_error) / dt
+        self.filtered_derivative = (self.alpha * self.filtered_derivative) + ((1.0 - self.alpha) * raw_derivative)
+        d = self.kd * self.filtered_derivative
+        
+        # Update state for next cycle
+        self.previous_error = error
+        self.last_time = now
+        
+        # 4. Calculate total output and clamp
+        raw_output = p + i + d
+        clamped_output = max(self.min_output, min(self.max_output, raw_output))
+        
+        # 5. Output Smoothing (EMA) to prevent abrupt step-function steering jumps
+        self.filtered_output = (self.alpha * self.filtered_output) + ((1.0 - self.alpha) * clamped_output)
+        
+        return self.filtered_output
+    
 # -----------------------------------------------------------------------------
-# Motor Controller (with Auto-Reconnect)
+# Motor Controller (with Smooth Interpolation & Auto-Reconnect)
 # -----------------------------------------------------------------------------
 class MotorController:
     def __init__(self, port, baud):
         self.port = port
         self.baud = baud
         self.ser = None
+        
+        # Tune Kp first, then add Kd to dampen oscillation, then Ki for steady-state error
+        self.steering_pid = PIDController(kp=0.4, ki=0.005, kd=0.12, output_limits=(-78, 78), alpha=0.5)
+        
         self.connect()
 
     def connect(self):
         try:
-            # ADD write_timeout=0.05 HERE:
-            self.ser = serial.Serial(self.port, self.baud, timeout=1, write_timeout=0.05)
+            self.ser = serial.Serial(self.port, self.baud, timeout=1)
             time.sleep(1)
             print(f"[INFO] Serial connected to {self.port}")
         except Exception as e:
@@ -798,16 +852,11 @@ class MotorController:
 
     def send_command(self, source, cmd):
         if self.ser is None or not self.ser.is_open:
-            return  # Skip instead of blocking the main loop trying to reconnect synchronously
-
+            return
         try:
             payload = f"{source}:{cmd}\n"
             packet = bytes([0x03]) + payload.encode('utf-8')
-            print(f"[SERIAL OUT] Source: {source} | Cmd: '{cmd}' | Hex Bytes: {packet.hex()}")
             self.ser.write(packet)
-        except serial.SerialTimeoutException:
-            # Just drop this packet if the buffer is busy, keeping the camera fluid!
-            pass
         except Exception as e:
             print(f"[WARNING] Serial error: {e}")
             self.ser = None
@@ -831,33 +880,37 @@ class MotorController:
             pan_scaled = max(30, min(240, int(float(p_angle))))
             tilt_byte = max(0, min(180, int(t_angle)))
             
+            # --- PID STEERING CALCULATION ---
             err = steering_error if steering_error is not None else 0
-            encoded_error = int(err) + 100
-            encoded_error = max(0, min(255, encoded_error))
-            base_speed = max(0, min(255, int(base_speed)))
             
-            # Single unified packet: [Header 0x02, Pan, Tilt, Steering Error, Speed]
-            packet = bytes([0x02, pan_scaled, tilt_byte, encoded_error, base_speed])
-            print(f"DEBUG: Sending packet -> {packet.hex()}")
+            # Run error through smoothed PID controller
+            pid_correction = self.steering_pid.compute(err)
+            
+            # Encode steering error (100 is neutral center)
+            encoded_error = int(100 + pid_correction)
+            encoded_error = max(0, min(255, encoded_error))
+            
+            # Dynamic speed scaling: smoothly reduce speed during sharp corrections
+            turn_severity = abs(err) / 100.0
+            adjusted_speed = base_speed * (1.0 - min(0.5, turn_severity))
+            final_speed = max(0, min(255, int(adjusted_speed)))
+            # -------------------------------
+            
+            packet = bytes([0x02, pan_scaled, tilt_byte, encoded_error, final_speed])
             self.ser.write(packet)
             
-            print(f"[SERIAL OUT] Hybrid Cmd | Pan: {pan_scaled} | Tilt: {tilt_byte} | Err: {encoded_error} | Speed: {base_speed} | Hex: {packet.hex()}")
-            
-        except serial.SerialTimeoutException:
-            pass
         except Exception as e:
             print(f"[WARNING] Failed to send hybrid tracking command over serial: {e}")
+            self.ser = None
 
-    def send_buzzer_command(self, statu=True):
+    def send_buzzer_command(self, state=True):
+    
         if self.ser is None or not self.ser.is_open:
             return
         try:
             header_byte = 0x04 if state else 0x05
-            packet = bytes(header_byte)
-            print(f"[SERIAL OUT] Buzzer State: {'ON' if state else 'OFF'} | Hex Bytes: {packet.hex()}")
+            packet = bytes([header_byte])
             self.ser.write(packet)
-        except serial.SerialTimeoutException:
-            pass
         except Exception as e:
             print(f"[WARNING] Failed to send buzzer command over serial: {e}")
             self.ser = None
@@ -1300,24 +1353,27 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
                                                                   
                     
-                    elif target_x_center is not None:
-                        missing_target_count = 0  # Reset counter on valid target
+                    elif active_target is not None:
+                        missing_target_count = 0  
+                        xmin, ymin, xmax, ymax = active_target["bbox"]
+                        
+                        raw_x_center = int((xmin + xmax) / 2)
+                        raw_y_center = int((ymin + ymax) / 2)
                         
                         # EMA Smoothing Filter
                         ALPHA = 0.4
                         if not hasattr(servo_tracker, 'smoothed_x'):
-                            servo_tracker.smoothed_x = target_x_center
-                            servo_tracker.smoothed_y = int((target_bbox[1] + target_bbox[3]) / 2)
+                            servo_tracker.smoothed_x = raw_x_center
+                            servo_tracker.smoothed_y = raw_y_center
 
-                        servo_tracker.smoothed_x = (ALPHA * target_x_center) + ((1 - ALPHA) * servo_tracker.smoothed_x)
-                        raw_y_center = int((target_bbox[1] + target_bbox[3]) / 2)
+                        servo_tracker.smoothed_x = (ALPHA * raw_x_center) + ((1 - ALPHA) * servo_tracker.smoothed_x)
                         servo_tracker.smoothed_y = (ALPHA * raw_y_center) + ((1 - ALPHA) * servo_tracker.smoothed_y)
 
-                        # Calculate errors using smoothed center points
+                        # Calculate raw errors
                         steering_error = int(servo_tracker.smoothed_x - (FRAME_WIDTH // 2))
                         vertical_error = int(servo_tracker.smoothed_y - (FRAME_HEIGHT // 2))
                         
-                        # --- INCREASED DEADZONE FILTER ---
+                        # --- DEADZONE FILTER (Prevents micro-jitter when centered) ---
                         DEADZONE_X = 20
                         DEADZONE_Y = 20
                         
@@ -1325,27 +1381,21 @@ def main():
                             steering_error = 0
                         if abs(vertical_error) < DEADZONE_Y:
                             vertical_error = 0
-                        
-                        # --- PAN BOUNDARY & ANTI-WINDUP CHECK ---
-                        servo_tracker.pan_angle -= steering_error * 0.02
-                        if servo_tracker.pan_angle < PAN_MIN:
-                            servo_tracker.pan_angle = PAN_MIN
-                            steering_error = 0
-                        elif servo_tracker.pan_angle > PAN_MAX:
-                            servo_tracker.pan_angle = PAN_MAX
-                            steering_error = 0
+                        # -------------------------------------------------------------
 
-                        # --- TILT BOUNDARY & ANTI-WINDUP CHECK ---
-                        servo_tracker.tilt_angle -= vertical_error * 0.02
-                        if servo_tracker.tilt_angle < TILT_MIN:
-                            servo_tracker.tilt_angle = TILT_MIN
-                            vertical_error = 0
-                        elif servo_tracker.tilt_angle > TILT_MAX:
-                            servo_tracker.tilt_angle = TILT_MAX
-                            vertical_error = 0
+                        # --- DIRECT PAN/TILT TRACKING (PID REMOVED FOR CAMERA) ---
+                        servo_tracker.pan_angle -= steering_error * 0.02
+                        servo_tracker.pan_angle = max(PAN_MIN, min(PAN_MAX, servo_tracker.pan_angle))
                         
-                        raw_speed = int(abs(steering_error) * 0.4 + abs(vertical_error) * 0.4)
-                        dynamic_speed = max(10, min(100, raw_speed)) if abs(steering_error) > 5 else 0
+                        servo_tracker.tilt_angle -= vertical_error * 0.02
+                        servo_tracker.tilt_angle = max(TILT_MIN, min(TILT_MAX, servo_tracker.tilt_angle))
+                        
+                        # Standard error encoding for motor/steering transmission (100 is center)
+                        encoded_error = int(100 + (steering_error * 0.1))
+                        encoded_error = max(0, min(255, encoded_error))
+                        
+                        raw_speed = int(abs(steering_error) * 0.3)
+                        dynamic_speed = max(15, min(90, raw_speed)) if abs(steering_error) > 5 else 0
                         
                         current_time = time.time()
                         if current_time - last_serial_send_time >= 0.033:
@@ -1353,7 +1403,7 @@ def main():
                                 motor.send_hybrid_tracking_command(
                                     servo_tracker.pan_angle, 
                                     servo_tracker.tilt_angle, 
-                                    steering_error, 
+                                    encoded_error, 
                                     dynamic_speed
                                 )
                                 last_serial_send_time = current_time
@@ -1363,11 +1413,11 @@ def main():
                         is_tracking_active = True
                         current_source = "TRACKING"
 
-                        xmin, ymin, xmax, ymax = target_bbox
                         box_height = ymax - ymin
                         
-                        IDEAL_BOX_HEIGHT = 300  # Adjust this based on your preferred distance (in pixels)
-                        HEIGHT_TOLERANCE = 40   # Deadzone buffer so the robot doesn't jitter back and forth
+                        # --- BALANCED FOLLOWING DISTANCE ---
+                        IDEAL_BOX_HEIGHT = 200  
+                        HEIGHT_TOLERANCE = 35   
                         
                         if box_height < (IDEAL_BOX_HEIGHT - HEIGHT_TOLERANCE):
                             current_frame_command = "FORWARD"
@@ -1379,8 +1429,8 @@ def main():
                             current_frame_command = "STOP"
                             current_source = "TRACKING_DISTANCE"      
 
-                        cv2.putText(display_frame, "TRACKING (Holding target loss...)", (20, 90),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+                        cv2.putText(display_frame, "TRACKING ACTIVE", (20, 90),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                         
                     else:
                         # --- RETURN TO HOME POSITION ---
