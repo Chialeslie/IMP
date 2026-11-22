@@ -636,6 +636,20 @@ class OfflineVoiceRecognizer:
         except Exception as e:
             print(f"[SERIAL TEXT ERROR]: {e}")
 
+    def say_muted(self, text: str, extra_hold: float = 0.0, cooldown: float = 1.2):
+        """Speaks via self.speaker while keeping Vosk muted during playback + cooldown."""
+        if not self.speaker or not text:
+            return
+        self.set_speaking(True)
+        try:
+            self.speaker.say(text)
+            # If speaker.say() is non-blocking, estimate ~0.07s per char + extra_hold
+            est_play_time = max(extra_hold, len(text) * 0.07)
+            if est_play_time > 0:
+                time.sleep(est_play_time)
+        finally:
+            self.set_speaking(False, cooldown=cooldown)
+
     def _init_voice_encoder(self, vip_ref_paths=None):
         """Loads multi-speaker Resemblyzer embeddings from pickle."""
         try:
@@ -733,7 +747,7 @@ class OfflineVoiceRecognizer:
                     if self.speaker:
                         self.speaker.say(speech_reply)
                 finally:
-                    self.set_speaking(False, cooldown=0.5)
+                    self.set_speaking(False, cooldown=1.3)
 
             while self.is_running:
                 if getattr(self, "is_speaking", False):
@@ -775,11 +789,11 @@ class OfflineVoiceRecognizer:
 
                         if not matched_entry:
                             print(f"[VOICE IGNORED] '{text}' is not in command allowlist.")
-                            self.recognizer = KaldiRecognizer(self.model, self.target_rate, self.grammar_json)
+                            self.recognizer.Reset()
                             continue
 
                         # Speaker Verification Check (only for allowlisted commands)
-                        is_verified, speaker_name = self._verify_speaker(utterance_pcm, threshold=0.49)
+                        is_verified, speaker_name = self._verify_speaker(utterance_pcm, threshold=0.55)
                         print(
                             f"[VOICE DEBUG] Speaker Verification Result: {is_verified} "
                             f"({speaker_name}) for '{text}' (RMS: {rms:.1f})"
@@ -799,14 +813,14 @@ class OfflineVoiceRecognizer:
                                     self.speaker.say("Command ignored. Unrecognized voice.")
                                 finally:
                                     self.set_speaking(False, cooldown=0.5)
-                            self.recognizer = KaldiRecognizer(self.model, self.target_rate, self.grammar_json)
+                            self.recognizer.Reset()
                             continue
 
                         print(f"[VOICE PASSED VERIFICATION]: '{text}' (User: {speaker_name})")
                         cmd_string, speech_reply = matched_entry
                         register_cmd(cmd_string, speech_reply)
                     else:
-                        self.recognizer = KaldiRecognizer(self.model, self.target_rate, self.grammar_json)
+                        self.recognizer.Reset()
                 else:
                     partial = json.loads(self.recognizer.PartialResult()).get("partial", "").strip()
                     if partial:
@@ -817,7 +831,7 @@ class OfflineVoiceRecognizer:
             import traceback
             traceback.print_exc()
 
-    def set_speaking(self, speaking: bool, cooldown: float = 1.0):
+    def set_speaking(self, speaking: bool, cooldown: float = 1.3):
         """Mutes listening while TTS speaks (plus a short tail cooldown) and flushes stale audio."""
         if speaking:
             self.is_speaking = True
@@ -834,15 +848,9 @@ class OfflineVoiceRecognizer:
                 self.utterance_active = False
             if hasattr(self, "audio_buffer"):
                 self.audio_buffer.clear()
-            if hasattr(self, "model") and hasattr(self, "target_rate"):
-                grammar = getattr(self, "grammar_json", None)
-                self.recognizer = (
-                    KaldiRecognizer(self.model, self.target_rate, grammar)
-                    if grammar
-                    else KaldiRecognizer(self.model, self.target_rate)
-                )
+            if hasattr(self, "recognizer") and self.recognizer:
+                self.recognizer.Reset()
             self.is_speaking = False
-
 
 # -----------------------------------------------------------------------------
 # Motor Controller (with Auto-Reconnect & Thread-Safe Serial Framing)
@@ -1140,6 +1148,7 @@ def main():
     last_greeted_times = {}
     greeting_cooldown_seconds = 3600.0
 
+    last_sent_source = None
     last_sent_command = None
     last_send_time = 0
     
@@ -1178,6 +1187,8 @@ def main():
     )
     pending_voice_cooldown_until = None
     VOICE_POST_SPEECH_COOLDOWN = 1.2
+    ignore_voice_until = 0.0
+    VOICE_SPEECH_IGNORE_DURATION = 9.0  # Covers greeting playback + acoustic echo tail
     #cv2.namedWindow("Robot Vision", cv2.WINDOW_NORMAL)
     #cv2.resizeWindow("Robot Vision", FRAME_WIDTH, FRAME_HEIGHT)
     try:
@@ -1200,9 +1211,9 @@ def main():
 
                 if frame_count % 3 == 0:
                     current_terrain = terrain_classifier.analyze_surface(frame, display_frame)
-                    is_fall, fall_status = pose_fall_detector.process_crop_or_frame(frame, display_frame, bbox=target_bbox)
-                    if is_fall and speaker:
-                        speaker.say("Warning! Fall detected! Requesting assistance.")
+                    # is_fall, fall_status = pose_fall_detector.process_crop_or_frame(frame, display_frame, bbox=target_bbox)
+                    # if is_fall and speaker:
+                    #     speaker.say("Warning! Fall detected! Requesting assistance.")
 
                 gesture_cmd = None
                 hand_side = "Unknown"
@@ -1267,16 +1278,22 @@ def main():
                                 current_time = time.time()
                                 if name not in last_greeted_times or (current_time - last_greeted_times[name] > greeting_cooldown_seconds):
                                     if speaker:
-                                        if voice_rec:
-                                            voice_rec.set_speaking(True)
-                                        try:
-                                            speaker.say(f"Hello {name}. Welcome back.")
-                                            speaker.wait_until_done()
-                                        finally:
+                                        if voice_rec and hasattr(voice_rec, "say_muted"):
+                                            voice_rec.say_muted(
+                                                f"Hello {name}. Welcome back.",
+                                                extra_hold=2.2,
+                                                cooldown=1.4,
+                                            )
+                                        else:
                                             if voice_rec:
-                                                voice_rec.set_speaking(False, cooldown=1.2)
+                                                voice_rec.set_speaking(True)
+                                            try:
+                                                speaker.say(f"Hello {name}. Welcome back.")
+                                            finally:
+                                                if voice_rec:
+                                                    voice_rec.set_speaking(False, cooldown=1.4)
                                     last_greeted_times[name] = current_time
-
+                                        
                         matched_body_det = None
                         for det in detections:
                             bx1, by1, bx2, by2 = det["bbox"]
@@ -1347,8 +1364,17 @@ def main():
                         last_valid_target = None
 
                 # --- VOICE QUEUE PROCESSING ---
-                try:
-                    v_cmd = voice_queue.get_nowait()
+                while True:
+                    try:
+                        v_cmd = voice_queue.get_nowait()
+                        voice_queue.task_done()
+                    except queue.Empty:
+                        break
+
+                    if time.time() < ignore_voice_until:
+                        print(f"[VOICE IGNORED]: Discarded self-speech/echo command '{v_cmd}'")
+                        continue
+
                     v_cmd_str = str(v_cmd).upper()
 
                     if v_cmd in ["VIP_FOLLOW", "GUEST", "CARE_TAKER", "PATIENT"]:
@@ -1376,9 +1402,6 @@ def main():
                         print(f"[MODE] Temporary Voice Override Activated: {v_cmd}")
                         manual_voice_override = v_cmd
                         voice_override_expiry_time = time.time() + VOICE_OVERRIDE_DURATION
-                    voice_queue.task_done()
-                except queue.Empty:
-                    pass
 
                 if active_target is not None:
                     xmin, ymin, xmax, ymax = active_target["bbox"]
@@ -1552,24 +1575,20 @@ def main():
                         if abs(vertical_error) < DEADZONE_Y:
                             vertical_error = 0
 
-                        servo_tracker.pan_angle -= steering_error * 0.02
-                        if servo_tracker.pan_angle < PAN_MIN:
-                            servo_tracker.pan_angle = PAN_MIN
-                            steering_error = 0
-                        elif servo_tracker.pan_angle > PAN_MAX:
-                            servo_tracker.pan_angle = PAN_MAX
-                            steering_error = 0
+                        MAX_STEP = 1.5
+                        pan_delta = max(-MAX_STEP, min(MAX_STEP, steering_error * 0.015))
+                        tilt_delta = max(-MAX_STEP, min(MAX_STEP, vertical_error * 0.015))
+                        servo_tracker.pan_angle = max(PAN_MIN, min(PAN_MAX, servo_tracker.pan_angle - pan_delta))
+                        servo_tracker.tilt_angle = max(TILT_MIN, min(TILT_MAX, servo_tracker.tilt_angle - tilt_delta))
 
-                        servo_tracker.tilt_angle -= vertical_error * 0.02
-                        if servo_tracker.tilt_angle < TILT_MIN:
-                            servo_tracker.tilt_angle = TILT_MIN
-                            vertical_error = 0
-                        elif servo_tracker.tilt_angle > TILT_MAX:
-                            servo_tracker.tilt_angle = TILT_MAX
+                        if servo_tracker.pan_angle <= PAN_MIN or servo_tracker.pan_angle >= PAN_MAX:
+                            steering_error = 0
+                        if servo_tracker.tilt_angle <= TILT_MIN or servo_tracker.tilt_angle >= TILT_MAX:
                             vertical_error = 0
 
                         raw_speed = int(abs(steering_error) * 0.4 + abs(vertical_error) * 0.4)
                         dynamic_speed = max(10, min(100, raw_speed)) if abs(steering_error) > 5 else 0
+
 
                         xmin, ymin, xmax, ymax = target_bbox
                         raw_box_height = float(max(0, ymax - ymin))
@@ -1579,14 +1598,14 @@ def main():
                         current_source = "TRACKING_DISTANCE"
                         is_tracking_active = True
 
-                        current_time = time.time()
-                        if current_frame_command != "STOP" and (current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL):
+                        drive_speed = dynamic_speed if current_frame_command != "STOP" else 0
+                        if current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL:
                             try:
                                 motor.send_hybrid_tracking_command(
                                     servo_tracker.pan_angle,
                                     servo_tracker.tilt_angle,
                                     steering_error,
-                                    dynamic_speed
+                                    drive_speed
                                 )
                                 last_serial_send_time = current_time
                             except Exception as e:
@@ -1628,8 +1647,11 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
                 if current_frame_command:
-                    if current_frame_command != last_sent_command or (time.time() - last_send_time) > 0.5:
+                    current_pair = (current_source, current_frame_command)
+                    last_pair = (last_sent_source, last_sent_command)
+                    if current_pair != last_pair or (time.time() - last_send_time) > 0.5:
                         motor.send_command(current_source, current_frame_command)
+                        last_sent_source = current_source
                         last_sent_command = current_frame_command
                         last_send_time = time.time()
 
