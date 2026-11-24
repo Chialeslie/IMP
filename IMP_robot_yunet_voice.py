@@ -1715,7 +1715,7 @@ def main():
                 cv2.putText(cv2_display_frame, f"Cmd: {current_frame_command} ({current_source})",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-                cv2.imshow("Robot Vision", cv2_display_frame)
+                #cv2.imshow("Robot Vision", cv2_display_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
@@ -1762,3 +1762,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
