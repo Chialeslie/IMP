@@ -27,7 +27,7 @@ import librosa
 from datetime import datetime
 from resemblyzer import VoiceEncoder, preprocess_wav
 from pathlib import Path
-from collections import deque
+from collections import deque, defaultdict, Counter
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -103,51 +103,109 @@ HAND_CONNECTIONS = [
 # IMX500 AI Camera Thread
 # -----------------------------------------------------------------------------
 class IMX500Camera:
-    def __init__(self, model_path):
+    def __init__(self, model_path, target_fps=30, fps_window_size=30, print_fps_interval=5.0):
         print("[TRACE] Initializing native Picamera2 + IMX500 context...")
         self.imx500 = IMX500(model_path)
-        # Pass the imx500 camera identifier to Picamera2
         self.picam2 = Picamera2(self.imx500.camera_num)
-        
-        config = self.picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
+
+        default_w = globals().get("FRAME_WIDTH", 640)
+        default_h = globals().get("FRAME_HEIGHT", 480)
+        self.frame_width = int(default_w)
+        self.frame_height = int(default_h)
+
+        config = self.picam2.create_video_configuration(
+            main={"size": (self.frame_width, self.frame_height), "format": "RGB888"},
+            controls={"FrameRate": target_fps},
+        )
         self.picam2.configure(config)
         self.picam2.start()
-        print("[TRACE] IMX500 camera started successfully.")
+
+        # Sync actual configured dimensions if available
+        main_size = config.get("main", {}).get("size")
+        if main_size and len(main_size) == 2:
+            self.frame_width, self.frame_height = int(main_size[0]), int(main_size[1])
+
+        # FPS tracking state
+        self._timestamps = deque(maxlen=max(2, fps_window_size))
+        self._current_fps = 0.0
+        self._print_fps_interval = print_fps_interval
+        self._last_fps_log = time.monotonic()
+
+        print(
+            f"[TRACE] IMX500 camera started ({self.frame_width}x{self.frame_height}, "
+            f"target {target_fps} FPS)."
+        )
+
+    @property
+    def fps(self):
+        """Return the latest measured rolling FPS."""
+        return self._current_fps
+
+    def _update_fps(self):
+        now = time.monotonic()
+        self._timestamps.append(now)
+        if len(self._timestamps) >= 2:
+            elapsed = self._timestamps[-1] - self._timestamps[0]
+            if elapsed > 0:
+                self._current_fps = (len(self._timestamps) - 1) / elapsed
+
+        if self._print_fps_interval and (now - self._last_fps_log) >= self._print_fps_interval:
+            print(f"[FPS] Measured IMX500 capture rate: {self._current_fps:.1f} FPS")
+            self._last_fps_log = now
 
     def read(self):
+        request = None
         try:
-            frame = self.picam2.capture_array("main")
-            metadata = self.picam2.capture_metadata()
-            return frame, metadata if metadata else {}
-        except Exception:
+            request = self.picam2.capture_request()
+            frame = request.make_array("main")
+            metadata = request.get_metadata() or {}
+
+            if frame is not None and hasattr(frame, "shape") and len(frame.shape) >= 2:
+                self.frame_height, self.frame_width = int(frame.shape[0]), int(frame.shape[1])
+
+            self._update_fps()
+            return frame, metadata
+        except Exception as e:
+            print(f"[READ ERROR]: {e}")
             return None, {}
+        finally:
+            if request is not None:
+                request.release()
 
     def parse_detections(self, metadata, confidence_threshold=0.5, target_class_id=0):
         detections = []
+        w, h = self.frame_width, self.frame_height
         try:
             outputs = self.imx500.get_outputs(metadata)
             if outputs is not None:
                 for detection in outputs:
-                    flat_det = detection.flatten() if hasattr(detection, 'flatten') else detection
-                    
+                    flat_det = detection.flatten() if hasattr(detection, "flatten") else detection
+
                     if len(flat_det) >= 6:
-                        ymin, xmin, ymax, xmax = float(flat_det[0]), float(flat_det[1]), float(flat_det[2]), float(flat_det[3])
+                        ymin, xmin, ymax, xmax = (
+                            float(flat_det[0]),
+                            float(flat_det[1]),
+                            float(flat_det[2]),
+                            float(flat_det[3]),
+                        )
                         conf = float(flat_det[4])
                         class_id = int(flat_det[5])
-                        
+
                         if not (0.0 <= conf <= 1.0):
                             continue
-                            
-                        if conf >= confidence_threshold and (target_class_id is None or class_id == target_class_id):
-                            x1 = int(xmin * FRAME_WIDTH)
-                            y1 = int(ymin * FRAME_HEIGHT)
-                            x2 = int(xmax * FRAME_WIDTH)
-                            y2 = int(ymax * FRAME_HEIGHT)
-                            
-                            if 0 <= x1 < x2 <= FRAME_WIDTH and 0 <= y1 < y2 <= FRAME_HEIGHT:
+
+                        if conf >= confidence_threshold and (
+                            target_class_id is None or class_id == target_class_id
+                        ):
+                            x1 = int(xmin * w)
+                            y1 = int(ymin * h)
+                            x2 = int(xmax * w)
+                            y2 = int(ymax * h)
+
+                            if 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h:
                                 detections.append({
-                                    "bbox": [x1, y1, x2, y2], 
-                                    "confidence": conf
+                                    "bbox": [x1, y1, x2, y2],
+                                    "confidence": conf,
                                 })
         except Exception as e:
             print(f"[PARSER ERROR]: {e}")
@@ -161,8 +219,6 @@ class IMX500Camera:
             print("[TRACE] IMX500 camera successfully released.")
         except Exception as e:
             print(f"[ERROR] Error shutting down IMX500 camera: {e}")
-            
-
 # -----------------------------------------------------------------------------
 # Robot Voice Synthesizer (TTS Helper)
 # -----------------------------------------------------------------------------
@@ -490,17 +546,21 @@ class GestureRecognizer:
         options = vision.HandLandmarkerOptions(
             base_options=base_options,
             num_hands=1,
-            min_hand_detection_confidence=0.60,  # Increased for strictness
-            min_tracking_confidence=0.60         # Increased for strictness
+            min_hand_detection_confidence=0.60,
+            min_tracking_confidence=0.60,
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
+        self.last_wrist_y = None
+        self.last_landmarks = None
 
     def process_frame(self, frame, display_frame):
         rgb_frame = frame
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         results = self.detector.detect(mp_image)
-        gesture_cmd = None  # Default to None so it doesn't force ghost values
+        gesture_cmd = None
         hand_side = "Unknown"
+        self.last_wrist_y = None
+        self.last_landmarks = None
 
         if results.hand_landmarks:
             for idx, hand_landmarks in enumerate(results.hand_landmarks):
@@ -508,6 +568,9 @@ class GestureRecognizer:
                     hand_side = results.handedness[idx][0].category_name
 
                 lm = hand_landmarks
+                wrist_y = lm[0].y
+                self.last_wrist_y = wrist_y
+                self.last_landmarks = lm
 
                 for connection in HAND_CONNECTIONS:
                     p1 = (int(lm[connection[0]].x * FRAME_WIDTH), int(lm[connection[0]].y * FRAME_HEIGHT))
@@ -519,15 +582,20 @@ class GestureRecognizer:
                 ring_open = lm[16].y < lm[14].y
                 pinky_open = lm[20].y < lm[18].y
 
-                thumb_index_dist = ((lm[4].x - lm[8].x)**2 + (lm[4].y - lm[8].y)**2)**0.5
-                wrist_y = lm[0].y
+                palm_scale = max(
+                    1e-5,
+                    ((lm[9].x - lm[0].x) ** 2 + (lm[9].y - lm[0].y) ** 2) ** 0.5,
+                )
+                pinch_ratio = (
+                    ((lm[4].x - lm[8].x) ** 2 + (lm[4].y - lm[8].y) ** 2) ** 0.5
+                ) / palm_scale
 
-                print(f"[GESTURE DEBUG] Hand: {hand_side} | Wrist Y: {wrist_y:.2f} | Index Up: {lm[8].y < lm[6].y}")
+                print(f"[GESTURE DEBUG] Hand: {hand_side} | Wrist Y: {wrist_y:.2f} | Index Up: {index_open}")
                 print(f"[DEBUG GESTURE] index_open: {index_open} | middle_open: {middle_open} | ring_open: {ring_open} | pinky_open: {pinky_open}")
 
                 # ONLY evaluate gestures if the hand is raised above 0.50 height gate
                 if wrist_y < 0.50:
-                    # 1. FORWARD: ONLY Index finger open (Highest priority for pointing)
+                    # 1. FORWARD: ONLY Index finger open
                     if index_open and not middle_open and not ring_open and not pinky_open:
                         gesture_cmd = "FORWARD"
                         break
@@ -536,26 +604,27 @@ class GestureRecognizer:
                     elif index_open and middle_open and not ring_open and not pinky_open:
                         gesture_cmd = "BACKWARD"
                         break
-                        
-                    # 3. OK Sign (Take Photo)
-                    elif thumb_index_dist < 0.07 and middle_open and ring_open and pinky_open:
+
+                    # 3. OK Sign (Take Photo): Thumb & index pinched relative to palm size, other 3 fingers open
+                    elif pinch_ratio < 0.35 and middle_open and ring_open and pinky_open:
                         gesture_cmd = "TAKE_PHOTO"
                         break
-                        
-                    # 4. Thumb Left / Right
-                    elif not middle_open and not ring_open and not pinky_open:
+
+                    # 4. Thumb Left / Right: Four fingers closed, thumb extended horizontally
+                    elif not index_open and not middle_open and not ring_open and not pinky_open:
                         thumb_dx = lm[4].x - lm[0].x
                         if abs(thumb_dx) > 0.12:
                             gesture_cmd = "LEFT" if thumb_dx < 0 else "RIGHT"
                             break
-                            
-                    # 5. STOP: All fingers open or flat hand (only when raised)
+
+                    # 5. STOP: All fingers open
                     elif index_open and middle_open and ring_open and pinky_open:
                         gesture_cmd = "STOP"
                         break
 
-        return gesture_cmd, hand_side
+                break
 
+        return gesture_cmd, hand_side
 # -----------------------------------------------------------------------------
 # Offline Voice Recognizer (Vosk + PyAudio)
 # -----------------------------------------------------------------------------
@@ -1063,6 +1132,276 @@ class DistanceTrackingController:
                 changed = True
 
         return self.active_cmd, self.smoothed_height, changed
+
+# --------------------------------------------------
+# Measure each loop iteration
+# --------------------------------------------------
+class LoopProfiler:
+    def __init__(self, interval=5.0):
+        self.interval = interval
+        self.totals = defaultdict(float)
+        self.counts = defaultdict(int)
+        self.last_report = time.monotonic()
+
+    def record(self, stage, elapsed_sec):
+        self.totals[stage] += elapsed_sec
+        self.counts[stage] += 1
+
+    def maybe_report(self):
+        now = time.monotonic()
+        if now - self.last_report >= self.interval:
+            parts = []
+            for stage, total in self.totals.items():
+                cnt = self.counts[stage]
+                avg_ms = (total / cnt * 1000.0) if cnt else 0.0
+                parts.append(f"{stage}={avg_ms:.1f}ms")
+            print("[PROFILE] " + " | ".join(parts))
+            self.totals.clear()
+            self.counts.clear()
+            self.last_report = now
+
+# ---------------------------------------------------------------
+# Decouple Heavy Vision Models with "Latest-Frame" Worker Threads
+# ----------------------------------------------------------------
+class LatestFrameWorker:
+    """Runs a slow vision callable asynchronously on the freshest frame."""
+
+    def __init__(self, name, infer_fn, log_every_sec=5.0):
+        self.name = name
+        self.infer_fn = infer_fn
+        self.log_every_sec = log_every_sec
+        self._in_q = queue.Queue(maxsize=1)
+        self._lock = threading.Lock()
+        self._latest_result = None
+        self._stop_event = threading.Event()
+
+        self._infer_sum_ms = 0.0
+        self._age_sum_ms = 0.0
+        self._count = 0
+        self._last_log = time.monotonic()
+
+        self._thread = threading.Thread(
+            target=self._run, name=f"worker-{name}", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, frame, capture_ts=None):
+        if frame is None:
+            return
+        if capture_ts is None:
+            capture_ts = time.monotonic()
+
+        payload = (frame.copy(), capture_ts)
+        if self._in_q.full():
+            try:
+                self._in_q.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._in_q.put_nowait(payload)
+        except queue.Full:
+            pass
+
+    def get_latest(self):
+        with self._lock:
+            return self._latest_result
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                frame, capture_ts = self._in_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            t0 = time.perf_counter()
+            try:
+                res = self.infer_fn(frame)
+            except Exception as e:
+                print(f"[{self.name} WORKER ERROR]: {e}", flush=True)
+                continue
+
+            done_mono = time.monotonic()
+            infer_ms = (time.perf_counter() - t0) * 1000.0
+            age_ms = (done_mono - capture_ts) * 1000.0
+
+            if isinstance(res, dict):
+                res.setdefault("capture_ts", capture_ts)
+                res["done_ts"] = done_mono
+                res["infer_ms"] = infer_ms
+                res["age_ms"] = age_ms
+
+            with self._lock:
+                self._latest_result = res
+                self._infer_sum_ms += infer_ms
+                self._age_sum_ms += age_ms
+                self._count += 1
+
+                if done_mono - self._last_log >= self.log_every_sec and self._count > 0:
+                    avg_infer = self._infer_sum_ms / self._count
+                    avg_age = self._age_sum_ms / self._count
+                    print(
+                        f"[WORKER:{self.name}] runs={self._count} | "
+                        f"avg_infer={avg_infer:.1f}ms | avg_age={avg_age:.1f}ms",
+                        flush=True,
+                    )
+                    self._infer_sum_ms = 0.0
+                    self._age_sum_ms = 0.0
+                    self._count = 0
+                    self._last_log = done_mono
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=1.0)
+# ---------------------------------------------------
+# Helper functions
+# ---------------------------------------------------
+def make_face_worker_fn(detector, embedder, db, get_override_name=None):
+    def _run_face(frame):
+        ts = time.time()
+        if detector is None or embedder is None:
+            return {"matches": [], "timestamp": ts}
+
+        h, w = frame.shape[:2]
+        bgr_for_yunet = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        detector.setInputSize((w, h))
+        _, faces = detector.detect(bgr_for_yunet)
+        if faces is None or len(faces) == 0:
+            return {"matches": [], "timestamp": time.time()}
+
+        override_name = get_override_name() if callable(get_override_name) else None
+        matches = []
+
+        for face in faces:
+            fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
+            fx1, fy1 = max(0, fx), max(0, fy)
+            fx2, fy2 = min(w, fx + fw), min(h, fy + fh)
+            crop = frame[fy1:fy2, fx1:fx2]
+            if crop.size == 0:
+                continue
+
+            name = "Unknown"
+            role = "none"
+            dist = None
+            if embedder is not None:
+                query_vector = embedder.get_embedding(crop)
+                name, role, dist = db.match_face(query_vector, max_distance=0.65)
+
+            is_known = name is not None and name != "Unknown"
+            is_authorized = bool(
+                is_known
+                and (
+                    str(role).upper() == "VIP_FOLLOW"
+                    or (override_name and str(name).lower() == str(override_name).lower())
+                )
+            )
+
+            conf = float(face[14]) if len(face) > 14 else 0.9
+            matches.append({
+                "name": name or "Unknown",
+                "role": role or "none",
+                "dist": dist,
+                "bbox": [fx1, fy1, fx2, fy2],
+                "confidence": conf,
+                "authorized": is_authorized,
+            })
+
+        return {"matches": matches, "timestamp": time.time()}
+
+    return _run_face
+
+
+def make_gesture_worker_fn(recognizer):
+    def _run_gesture(frame):
+        ts = time.time()
+        if recognizer is None:
+            return {"raw_cmd": None, "hand_side": "Unknown", "wrist_y": None, "timestamp": ts}
+
+        raw_result = recognizer.process_frame(frame, frame.copy())
+        wrist_y = getattr(recognizer, "last_wrist_y", None)
+
+        if isinstance(raw_result, tuple):
+            if len(raw_result) == 3:
+                raw_cmd, hand_side, wrist_y = raw_result
+            elif len(raw_result) == 2:
+                raw_cmd, hand_side = raw_result
+            else:
+                raw_cmd, hand_side = raw_result[0], "Unknown"
+        else:
+            raw_cmd, hand_side = raw_result, "Unknown"
+
+        return {
+            "raw_cmd": raw_cmd,
+            "hand_side": hand_side,
+            "wrist_y": wrist_y,
+            "timestamp": time.time(),
+        }
+
+    return _run_gesture
+
+# -------------------------------------------------------------------
+class GestureDebouncer:
+    """Debounces noisy per-frame gesture predictions with sliding-window consensus."""
+
+    def __init__(
+        self,
+        window_size=5,
+        min_votes=3,
+        max_age_sec=0.45,
+        action_thresholds=None,
+    ):
+        self.window = deque(maxlen=window_size)
+        self.min_votes = min_votes
+        self.max_age_sec = max_age_sec
+        self.action_thresholds = action_thresholds or {"TAKE_PHOTO": window_size}
+        self.confirmed_cmd = None
+        self._last_seen_done_ts = None
+
+    def update(self, gesture_res, now_mono=None):
+        """
+        Returns:
+            (active_cmd, newly_confirmed_event_cmd, is_stale, latest_raw_cmd)
+        """
+        if now_mono is None:
+            now_mono = time.monotonic()
+
+        if not gesture_res:
+            return None, None, True, None
+
+        done_ts = gesture_res.get("done_ts")
+        capture_ts = gesture_res.get("capture_ts", done_ts)
+        age_sec = (now_mono - capture_ts) if capture_ts is not None else 0.0
+        is_stale = age_sec > self.max_age_sec
+        latest_raw_cmd = gesture_res.get("raw_cmd")
+
+        if done_ts is not None and done_ts != self._last_seen_done_ts:
+            self._last_seen_done_ts = done_ts
+            if not is_stale:
+                self.window.append(latest_raw_cmd)
+            else:
+                self.window.clear()
+                self.confirmed_cmd = None
+
+        if is_stale:
+            return None, None, True, None
+
+        if not self.window:
+            return self.confirmed_cmd, None, False, latest_raw_cmd
+
+        counts = Counter(self.window)
+        candidate, votes = counts.most_common(1)[0]
+        needed_votes = self.action_thresholds.get(candidate, self.min_votes)
+
+        event_cmd = None
+        if candidate is None:
+            # Clear active gesture once neutral/closed/no-gesture dominates
+            if votes >= self.min_votes:
+                self.confirmed_cmd = None
+        elif votes >= needed_votes:
+            if candidate != self.confirmed_cmd:
+                self.confirmed_cmd = candidate
+                event_cmd = candidate
+
+        return self.confirmed_cmd, event_cmd, False, latest_raw_cmd
     
 # -----------------------------------------------------------------------------
 # Main Application Loop
@@ -1084,7 +1423,7 @@ def main():
         print(f"[ERROR] IMX500 failed to bind: {e}")
         return
 
-    time.sleep(1.0) 
+    time.sleep(1.0)
 
     try:
         hailo_embedder = Hailo10FaceEmbedder(HAILO10_FACE_HEF)
@@ -1093,7 +1432,6 @@ def main():
         print(f"[WARNING] Hailo initialization skipped: {e}")
         hailo_embedder = None
 
-    # --- Initialize YuNet Face Detector ---
     face_detector = None
     if os.path.exists(YUNET_MODEL_PATH):
         try:
@@ -1103,7 +1441,7 @@ def main():
                 input_size=(FRAME_WIDTH, FRAME_HEIGHT),
                 score_threshold=0.6,
                 nms_threshold=0.3,
-                top_k=5000
+                top_k=5000,
             )
             print("[INFO] YuNet Face Detector initialized successfully.")
         except Exception as e:
@@ -1115,10 +1453,10 @@ def main():
     terrain_classifier = TerrainClassifier()
 
     print("[TRACE] Initializing GestureRecognizer...")
-    try: 
+    try:
         gesture_rec = GestureRecognizer()
         print("[INFO] Hand Gesture Recognizer initialized.")
-    except Exception as e: 
+    except Exception as e:
         print(f"[WARNING] Gesture module failed: {e}")
 
     print("[TRACE] Initializing OfflineVoiceRecognizer...")
@@ -1127,9 +1465,9 @@ def main():
         print("[INFO] Offline Voice Control initialized.")
     except Exception as e:
         print(f"[WARNING] Voice module failed: {e}")
-    
+
     print("[TRACE] Voice module block cleared. Setting up loop variables...")
-    
+
     manual_voice_override = None
     target_role_to_follow = "VIP_FOLLOW"
     target_name_override = None
@@ -1143,36 +1481,37 @@ def main():
     TILT_MIN, TILT_MAX = 45, 105
 
     servo_tracker = DefaultServoTracker()
-    last_snapshot_time = 0
-    snapshot_cooldown = 2.0  
+    last_snapshot_time = 0.0
+    snapshot_cooldown = 15.0
+    photo_armed = True
     last_greeted_times = {}
     greeting_cooldown_seconds = 3600.0
 
     last_sent_source = None
     last_sent_command = None
-    last_send_time = 0
-    
+    last_send_time = 0.0
+
     frame_count = 0
     current_frame_command = "STOP"
     current_source = "HOLD"
-    last_serial_send_time = 0
+    last_serial_send_time = 0.0
     SERIAL_SEND_INTERVAL = 0.033
     missing_target_count = 0
     MAX_MISSING_FRAMES = 5
-    last_valid_target = None  # Explicitly initialized to prevent scope bugs
-    voice_override_expiry_time = 0
+    last_valid_target = None
+    voice_override_expiry_time = 0.0
     VOICE_OVERRIDE_DURATION = 2.0
     current_terrain = "PAVEMENT"
-    # --- TARGET LOCK STATE VARIABLES ---
+
     is_target_locked = False
     locked_body_box = None
-    lock_timer = 0
-    LOCK_TIMEOUT = 5.0  # Seconds to keep tracking body if face is lost
-    # --- CLOTHING / APPEARANCE LOCK VARIABLES ---
+    lock_timer = 0.0
+    LOCK_TIMEOUT = 5.0
+
     target_clothing_hist = None
     is_clothing_locked = False
     CLOTHING_LOCK_TIMEOUT = 2.0
-    clothing_lock_timer = 0
+    clothing_lock_timer = 0.0
     buzzer_triggered = False
     last_fall_speech_time = 0.0
     FALL_SPEECH_REPEAT_INTERVAL = 10.0
@@ -1188,9 +1527,23 @@ def main():
     pending_voice_cooldown_until = None
     VOICE_POST_SPEECH_COOLDOWN = 1.2
     ignore_voice_until = 0.0
-    VOICE_SPEECH_IGNORE_DURATION = 9.0  # Covers greeting playback + acoustic echo tail
-    #cv2.namedWindow("Robot Vision", cv2.WINDOW_NORMAL)
-    #cv2.resizeWindow("Robot Vision", FRAME_WIDTH, FRAME_HEIGHT)
+    VOICE_SPEECH_IGNORE_DURATION = 9.0
+
+    FACE_STRIDE = 4
+    GESTURE_STRIDE = 5
+    MAX_FACE_RESULT_AGE = 1.0
+    MAX_GESTURE_RESULT_AGE = 0.8
+
+    profiler = LoopProfiler(interval=5.0)
+    face_worker = LatestFrameWorker("face", make_face_worker_fn(face_detector, hailo_embedder, face_db))
+    gesture_worker = LatestFrameWorker("gesture", make_gesture_worker_fn(gesture_rec))
+    gesture_debouncer = GestureDebouncer(
+        window_size=5,
+        min_votes=3,
+        max_age_sec=MAX_GESTURE_RESULT_AGE,
+        action_thresholds={"TAKE_PHOTO": 5},
+    )
+
     try:
         print("[DEBUG] Entering main loop now...")
         while True:
@@ -1198,102 +1551,136 @@ def main():
             if frame_count % 30 == 0:
                 print(f"[STATUS] Running... Frame: {frame_count} | Command: {current_frame_command} | Source: {current_source}")
             try:
+                t0 = time.perf_counter()
                 frame, metadata = cam.read()
+                capture_ts = time.monotonic()
+                profiler.record("cam_read", time.perf_counter() - t0)
+
                 if frame is None:
+                    profiler.maybe_report()
                     time.sleep(0.005)
                     continue
 
+                now_ts = time.time()
+                current_time = now_ts
+
+                t0 = time.perf_counter()
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 display_frame = frame.copy()
-
                 target_bbox = None
                 target_x_center = None
 
                 if frame_count % 3 == 0:
                     current_terrain = terrain_classifier.analyze_surface(frame, display_frame)
-                    # is_fall, fall_status = pose_fall_detector.process_crop_or_frame(frame, display_frame, bbox=target_bbox)
-                    # if is_fall and speaker:
-                    #     speaker.say("Warning! Fall detected! Requesting assistance.")
-
-                gesture_cmd = None
-                hand_side = "Unknown"
-
-                if gesture_rec:
-                    if frame_count % 5 == 0:
-                        raw_result = gesture_rec.process_frame(frame, display_frame)
-                        if isinstance(raw_result, tuple):
-                            raw_cmd, hand_side = raw_result
-                        else:
-                            raw_cmd = raw_result
-
-                        if raw_cmd:
-                            if raw_cmd != persisted_gesture:
-                                persisted_gesture = raw_cmd
-                                print(f"[GESTURE] Detected new gesture: {raw_cmd}")
-
-                            gesture_cmd = persisted_gesture
-                            last_gesture_time = time.time()
-                        else:
-                            if time.time() - last_gesture_time < 0.5:
-                                gesture_cmd = persisted_gesture
-                            else:
-                                gesture_cmd = None
-                                persisted_gesture = "STOP"
-                    else:
-                        if time.time() - last_gesture_time < 0.5:
-                            gesture_cmd = persisted_gesture
-                        else:
-                            gesture_cmd = None
 
                 detections = cam.parse_detections(metadata, CONFIDENCE_THRESHOLD, TARGET_CLASS_ID)
+                profiler.record("prep_and_det", time.perf_counter() - t0)
+
+                # --- Gesture Worker (Submit + Debounce + Stale Check) ---
+                t0 = time.perf_counter()
+                if gesture_rec and frame_count % GESTURE_STRIDE == 0:
+                    gesture_worker.submit(frame, capture_ts=capture_ts)
+
+                latest_gesture = gesture_worker.get_latest()
+                now_mono = time.monotonic()
+                gest_age_ms = (
+                    ((now_mono - latest_gesture["capture_ts"]) * 1000.0)
+                    if latest_gesture and "capture_ts" in latest_gesture
+                    else -1.0
+                )
+
+                active_gesture, new_gesture_event, is_stale, latest_raw_cmd = gesture_debouncer.update(
+                    latest_gesture, now_mono=now_mono
+                )
+
+                if latest_raw_cmd != "TAKE_PHOTO":
+                    photo_armed = True
+
+                take_photo_triggered = False
+                if (
+                    not is_stale
+                    and new_gesture_event == "TAKE_PHOTO"
+                    and latest_raw_cmd == "TAKE_PHOTO"
+                    and photo_armed
+                    and (time.time() - last_snapshot_time) >= snapshot_cooldown
+                ):
+                    take_photo_triggered = True
+                    photo_armed = False
+                    last_snapshot_time = time.time()
+
+                hand_side = latest_gesture.get("hand_side", "Unknown") if latest_gesture else "Unknown"
+                lm = latest_gesture.get("landmarks") if (latest_gesture and not is_stale) else None
+                if lm is not None:
+                    for p1_idx, p2_idx in HAND_CONNECTIONS:
+                        x1 = int(lm[p1_idx].x * FRAME_WIDTH)
+                        y1 = int(lm[p1_idx].y * FRAME_HEIGHT)
+                        x2 = int(lm[p2_idx].x * FRAME_WIDTH)
+                        y2 = int(lm[p2_idx].y * FRAME_HEIGHT)
+                        cv2.line(display_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+                if new_gesture_event:
+                    persisted_gesture = new_gesture_event
+                    last_gesture_time = current_time
+                    print(
+                        f"[GESTURE] Confirmed new gesture: {new_gesture_event} "
+                        f"(infer={latest_gesture.get('infer_ms', 0):.1f}ms, age={gest_age_ms:.1f}ms)"
+                    )
+
+                if active_gesture is not None and not is_stale:
+                    gesture_cmd = active_gesture
+                    last_gesture_time = current_time
+                elif (current_time - last_gesture_time) < 0.5 and not is_stale:
+                    gesture_cmd = persisted_gesture
+                else:
+                    gesture_cmd = None
+                    persisted_gesture = "STOP"
+                profiler.record("gesture_stage", time.perf_counter() - t0)
+
+                # --- Face Worker (Submit + Stale Check + Clothing Lock) ---
+                t0 = time.perf_counter()
+                if face_detector is not None and hailo_embedder is not None and frame_count % FACE_STRIDE == 0:
+                    face_worker.submit(frame, capture_ts=capture_ts)
+
+                latest_face_result = face_worker.get_latest()
+                face_matches = []
+                if latest_face_result:
+                    result_ts = latest_face_result.get("timestamp", 0.0)
+                    if (current_time - result_ts) <= MAX_FACE_RESULT_AGE:
+                        face_matches = latest_face_result.get("matches", [])
 
                 chosen_det = None
                 authorized_face_detected = False
-                faces = []
 
-                if face_detector is not None:
-                    bgr_frame_for_yunet = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    face_detector.setInputSize((FRAME_WIDTH, FRAME_HEIGHT))
-                    _, faces = face_detector.detect(bgr_frame_for_yunet)
+                for match in face_matches:
+                    name = match["name"]
+                    role = match["role"]
+                    fx1, fy1, fx2, fy2 = match["bbox"]
+                    face_conf = match["confidence"]
 
-                # 1. Face Recognition Phase (Establishes Clothing Lock)
-                if faces is not None and len(faces) > 0:
-                    for face in faces:
-                        fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
-                        fx1, fy1, fx2, fy2 = max(0, fx), max(0, fy), min(FRAME_WIDTH, fx + fw), min(FRAME_HEIGHT, fy + fh)
+                    if name != "Unknown" and name is not None:
+                        current_tracked_name = name
+                        if match["authorized"]:
+                            authorized_face_detected = True
 
-                        person_crop = frame[fy1:fy2, fx1:fx2]
-                        name = "Unknown"
-                        role = "none"
+                        if name not in last_greeted_times or (current_time - last_greeted_times[name] > greeting_cooldown_seconds):
+                            if speaker:
+                                if voice_rec and hasattr(voice_rec, "say_muted"):
+                                    voice_rec.say_muted(
+                                        f"Hello {name}. Welcome back.",
+                                        extra_hold=2.2,
+                                        cooldown=1.4,
+                                    )
+                                else:
+                                    if voice_rec:
+                                        voice_rec.set_speaking(True)
+                                    try:
+                                        speaker.say(f"Hello {name}. Welcome back.")
+                                    finally:
+                                        if voice_rec:
+                                            voice_rec.set_speaking(False, cooldown=1.4)
+                            last_greeted_times[name] = current_time
 
-                        if person_crop.size > 0 and hailo_embedder:
-                            query_vector = hailo_embedder.get_embedding(person_crop)
-                            name, role, dist = face_db.match_face(query_vector, max_distance=0.65)
-
-                            if name != "Unknown" and name is not None:
-                                current_tracked_name = name
-                                if role.upper() == "VIP_FOLLOW" or (target_name_override and name.lower() == target_name_override.lower()):
-                                    authorized_face_detected = True
-
-                                current_time = time.time()
-                                if name not in last_greeted_times or (current_time - last_greeted_times[name] > greeting_cooldown_seconds):
-                                    if speaker:
-                                        if voice_rec and hasattr(voice_rec, "say_muted"):
-                                            voice_rec.say_muted(
-                                                f"Hello {name}. Welcome back.",
-                                                extra_hold=2.2,
-                                                cooldown=1.4,
-                                            )
-                                        else:
-                                            if voice_rec:
-                                                voice_rec.set_speaking(True)
-                                            try:
-                                                speaker.say(f"Hello {name}. Welcome back.")
-                                            finally:
-                                                if voice_rec:
-                                                    voice_rec.set_speaking(False, cooldown=1.4)
-                                    last_greeted_times[name] = current_time
-                                        
+                    if match["authorized"]:
                         matched_body_det = None
                         for det in detections:
                             bx1, by1, bx2, by2 = det["bbox"]
@@ -1301,26 +1688,38 @@ def main():
                                 matched_body_det = det
                                 break
 
-                        if authorized_face_detected:
-                            chosen_det = matched_body_det if matched_body_det else {"bbox": [fx1, fy1, fx2, fy2], "confidence": face[14]}
+                        chosen_det = matched_body_det if matched_body_det else {
+                            "bbox": [fx1, fy1, fx2, fy2],
+                            "confidence": face_conf,
+                        }
 
-                            bx1, by1, bx2, by2 = chosen_det["bbox"]
-                            torso_ymin = int(by1 + (by2 - by1) * 0.2)
-                            torso_ymax = int(by1 + (by2 - by1) * 0.7)
-                            torso_crop = frame[max(0, torso_ymin):min(FRAME_HEIGHT, torso_ymax), max(0, bx1):min(FRAME_WIDTH, bx2)]
+                        bx1, by1, bx2, by2 = chosen_det["bbox"]
+                        torso_ymin = int(by1 + (by2 - by1) * 0.2)
+                        torso_ymax = int(by1 + (by2 - by1) * 0.7)
+                        torso_crop = frame[
+                            max(0, torso_ymin):min(FRAME_HEIGHT, torso_ymax),
+                            max(0, bx1):min(FRAME_WIDTH, bx2),
+                        ]
 
-                            if torso_crop.size > 0:
-                                hsv_torso = cv2.cvtColor(torso_crop, cv2.COLOR_RGB2HSV)
-                                target_clothing_hist = cv2.calcHist([hsv_torso], [0, 1], None, [32, 32], [0, 180, 0, 256])
-                                cv2.normalize(target_clothing_hist, target_clothing_hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-                                is_clothing_locked = True
-                                clothing_lock_timer = time.time()
+                        if torso_crop.size > 0:
+                            hsv_torso = cv2.cvtColor(torso_crop, cv2.COLOR_RGB2HSV)
+                            target_clothing_hist = cv2.calcHist(
+                                [hsv_torso], [0, 1], None, [32, 32], [0, 180, 0, 256]
+                            )
+                            cv2.normalize(
+                                target_clothing_hist,
+                                target_clothing_hist,
+                                alpha=0,
+                                beta=1,
+                                norm_type=cv2.NORM_MINMAX,
+                            )
+                            is_clothing_locked = True
+                            clothing_lock_timer = current_time
 
-                            break
+                        break
 
-                # 2. Face Lost Phase: Match via Clothing Histogram across Body Detections
                 if not chosen_det and is_clothing_locked and detections:
-                    if time.time() - clothing_lock_timer < CLOTHING_LOCK_TIMEOUT and target_clothing_hist is not None:
+                    if (current_time - clothing_lock_timer) < CLOTHING_LOCK_TIMEOUT and target_clothing_hist is not None:
                         best_match_det = None
                         highest_score = -1.0
 
@@ -1328,12 +1727,23 @@ def main():
                             bx1, by1, bx2, by2 = det["bbox"]
                             torso_ymin = int(by1 + (by2 - by1) * 0.2)
                             torso_ymax = int(by1 + (by2 - by1) * 0.7)
-                            candidate_torso = frame[max(0, torso_ymin):min(FRAME_HEIGHT, torso_ymax), max(0, bx1):min(FRAME_WIDTH, bx2)]
+                            candidate_torso = frame[
+                                max(0, torso_ymin):min(FRAME_HEIGHT, torso_ymax),
+                                max(0, bx1):min(FRAME_WIDTH, bx2),
+                            ]
 
                             if candidate_torso.size > 0:
                                 hsv_cand = cv2.cvtColor(candidate_torso, cv2.COLOR_RGB2HSV)
-                                cand_hist = cv2.calcHist([hsv_cand], [0, 1], None, [32, 32], [0, 180, 0, 256])
-                                cv2.normalize(cand_hist, cand_hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+                                cand_hist = cv2.calcHist(
+                                    [hsv_cand], [0, 1], None, [32, 32], [0, 180, 0, 256]
+                                )
+                                cv2.normalize(
+                                    cand_hist,
+                                    cand_hist,
+                                    alpha=0,
+                                    beta=1,
+                                    norm_type=cv2.NORM_MINMAX,
+                                )
 
                                 score = cv2.compareHist(target_clothing_hist, cand_hist, 0)
 
@@ -1344,11 +1754,21 @@ def main():
                         if best_match_det:
                             chosen_det = best_match_det
                             authorized_face_detected = True
-                            cv2.putText(display_frame, f"LOCKED TO CLOTHING (Score: {highest_score:.2f})", (20, 120),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                            cv2.putText(
+                                display_frame,
+                                f"LOCKED TO CLOTHING (Score: {highest_score:.2f})",
+                                (20, 120),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6,
+                                (0, 165, 255),
+                                2,
+                            )
                     else:
                         is_clothing_locked = False
                         target_clothing_hist = None
+                profiler.record("face_and_lock", time.perf_counter() - t0)
+
+                t0 = time.perf_counter()
 
                 # --- TARGET BUFFER & GRACE PERIOD LOGIC ---
                 if chosen_det is not None:
@@ -1403,9 +1823,29 @@ def main():
                         manual_voice_override = v_cmd
                         voice_override_expiry_time = time.time() + VOICE_OVERRIDE_DURATION
 
+                BOX_ALPHA = 0.25
+
                 if active_target is not None:
-                    xmin, ymin, xmax, ymax = active_target["bbox"]
-                    target_bbox = active_target["bbox"]
+                    raw_xmin, raw_ymin, raw_xmax, raw_ymax = active_target["bbox"]
+
+                    if not hasattr(servo_tracker, "smoothed_bbox") or servo_tracker.smoothed_bbox is None:
+                        servo_tracker.smoothed_bbox = [
+                            float(raw_xmin),
+                            float(raw_ymin),
+                            float(raw_xmax),
+                            float(raw_ymax),
+                        ]
+                    else:
+                        sx1, sy1, sx2, sy2 = servo_tracker.smoothed_bbox
+                        servo_tracker.smoothed_bbox = [
+                            BOX_ALPHA * raw_xmin + (1.0 - BOX_ALPHA) * sx1,
+                            BOX_ALPHA * raw_ymin + (1.0 - BOX_ALPHA) * sy1,
+                            BOX_ALPHA * raw_xmax + (1.0 - BOX_ALPHA) * sx2,
+                            BOX_ALPHA * raw_ymax + (1.0 - BOX_ALPHA) * sy2,
+                        ]
+
+                    xmin, ymin, xmax, ymax = [int(round(v)) for v in servo_tracker.smoothed_bbox]
+                    target_bbox = [xmin, ymin, xmax, ymax]
                     target_x_center = int((xmin + xmax) / 2)
                     person_box_height = float(max(0, ymax - ymin))
 
@@ -1424,6 +1864,8 @@ def main():
                     if manual_voice_override is None:
                         current_frame_command = dist_cmd
                         current_source = "TRACKING_DISTANCE"
+                else:
+                    servo_tracker.smoothed_bbox = None
 
                 cv2.line(display_frame, (FRAME_WIDTH // 2, 0), (FRAME_WIDTH // 2, FRAME_HEIGHT), (100, 100, 100), 1)
 
@@ -1522,32 +1964,28 @@ def main():
                         cv2.putText(display_frame, f"GESTURE CMD: {gesture_cmd}", (20, 90),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
 
-                    elif authorized_face_detected and gesture_cmd == "TAKE_PHOTO":
-                        current_time = time.time()
-                        if current_time - last_snapshot_time > snapshot_cooldown:
-                            display_timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            file_timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                            snapshot_img = frame.copy()
+                    elif take_photo_triggered:
+                        display_timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        file_timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                        snapshot_img = frame.copy()
 
-                            cv2.putText(
-                                snapshot_img,
-                                display_timestamp_str,
-                                (20, FRAME_HEIGHT - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.7,
-                                (255, 255, 255),
-                                2,
-                                cv2.LINE_AA
-                            )
+                        cv2.putText(
+                            snapshot_img,
+                            display_timestamp_str,
+                            (20, FRAME_HEIGHT - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
 
-                            filename = f"robot_snapshot_{file_timestamp_str}.jpg"
-                            cv2.imwrite(filename, cv2.cvtColor(snapshot_img, cv2.COLOR_RGB2BGR))
-                            print(f"[SNAPSHOT] Photo successfully saved: {filename}")
+                        filename = f"robot_snapshot_{file_timestamp_str}.jpg"
+                        cv2.imwrite(filename, cv2.cvtColor(snapshot_img, cv2.COLOR_RGB2BGR))
+                        print(f"[SNAPSHOT] Photo successfully saved: {filename}")
 
-                            if speaker:
-                                speaker.say("Photo taken.")
-
-                            last_snapshot_time = current_time
+                        if speaker:
+                            speaker.say("Photo taken.")
 
                         cv2.putText(display_frame, "GESTURE CMD: TAKE_PHOTO", (20, 90),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
@@ -1556,7 +1994,7 @@ def main():
                         missing_target_count = 0
 
                         ALPHA = 0.4
-                        if not hasattr(servo_tracker, 'smoothed_x'):
+                        if not hasattr(servo_tracker, "smoothed_x"):
                             servo_tracker.smoothed_x = target_x_center
                             servo_tracker.smoothed_y = int((target_bbox[1] + target_bbox[3]) / 2)
 
@@ -1589,7 +2027,6 @@ def main():
                         raw_speed = int(abs(steering_error) * 0.4 + abs(vertical_error) * 0.4)
                         dynamic_speed = max(10, min(100, raw_speed)) if abs(steering_error) > 5 else 0
 
-
                         xmin, ymin, xmax, ymax = target_bbox
                         raw_box_height = float(max(0, ymax - ymin))
                         dist_cmd, smoothed_h, dist_changed = dist_ctrl.update(raw_box_height)
@@ -1605,7 +2042,7 @@ def main():
                                     servo_tracker.pan_angle,
                                     servo_tracker.tilt_angle,
                                     steering_error,
-                                    drive_speed
+                                    drive_speed,
                                 )
                                 last_serial_send_time = current_time
                             except Exception as e:
@@ -1637,7 +2074,7 @@ def main():
                                     servo_tracker.pan_angle,
                                     servo_tracker.tilt_angle,
                                     0,
-                                    50
+                                    50,
                                 )
                                 last_serial_send_time = current_time
                             except Exception:
@@ -1650,7 +2087,10 @@ def main():
                     current_pair = (current_source, current_frame_command)
                     last_pair = (last_sent_source, last_sent_command)
                     if current_pair != last_pair or (time.time() - last_send_time) > 0.5:
-                        motor.send_command(current_source, current_frame_command)
+                        try:
+                            motor.send_command(current_source, current_frame_command)
+                        except Exception as e:
+                            print(f"[SERIAL WARNING]: Failed to send command: {e}")
                         last_sent_source = current_source
                         last_sent_command = current_frame_command
                         last_send_time = time.time()
@@ -1660,49 +2100,70 @@ def main():
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                 cv2.imshow("Robot Vision", cv2_display_frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
+                profiler.record("decision_and_io", time.perf_counter() - t0)
+                profiler.maybe_report()
                 time.sleep(0.01)
 
             except Exception as loop_err:
                 print(f"[ERROR INSIDE LOOP]: {loop_err}")
                 import traceback
                 traceback.print_exc()
-                break
     
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down gracefully...")
         
     finally:
+        print("[TRACE] Cleaning up workers, peripherals, and camera...")
         try:
-            if 'cam' in locals() and cam:
-                cam.running = False
-        except Exception:
-            pass
+            if face_worker:
+                face_worker.stop()
+        except Exception as e:
+            print(f"[WARNING] face_worker stop error: {e}")
+
+        try:
+            if gesture_worker:
+                gesture_worker.stop()
+        except Exception as e:
+            print(f"[WARNING] gesture_worker stop error: {e}")
+
+        try:
+            if motor:
+                motor.send_command("HOLD", "STOP")
+                motor.close()
+        except Exception as e:
+            print(f"[WARNING] motor cleanup error: {e}")
+
         try:
             if speaker:
                 speaker.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARNING] speaker stop error: {e}")
+
         try:
             if voice_rec:
-                voice_rec.stop()
-        except Exception:
-            pass
+                if hasattr(voice_rec, "stop"):
+                    voice_rec.stop()
+                elif hasattr(voice_rec, "close"):
+                    voice_rec.close()
+        except Exception as e:
+            print(f"[WARNING] voice_rec stop error: {e}")
+
         try:
-            if motor:
-                motor.close()
-        except Exception:
-            pass
+            if "cam" in locals() and cam:
+                cam.running = False
+                cam.close()
+        except Exception as e:
+            print(f"[WARNING] camera close error: {e}")
+
         try:
             cv2.destroyAllWindows()
         except Exception:
             pass
-            
+
         print("[INFO] System shutdown complete.")
-        #import os
-        os._exit(0)
 
 if __name__ == "__main__":
     main()
