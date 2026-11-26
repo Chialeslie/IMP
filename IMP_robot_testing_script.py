@@ -32,6 +32,8 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from vosk import Model, KaldiRecognizer
+from typing import Any, Callable, Optional
+from hailo_platform import FormatType, VDevice
 
 # Hailo RT Imports
 from hailo_platform import HEF, VDevice, HailoStreamInterface, ConfigureParams, InputVStreamParams, OutputVStreamParams, InputVStreams, OutputVStreams, FormatType
@@ -219,6 +221,7 @@ class IMX500Camera:
             print("[TRACE] IMX500 camera successfully released.")
         except Exception as e:
             print(f"[ERROR] Error shutting down IMX500 camera: {e}")
+
 # -----------------------------------------------------------------------------
 # Robot Voice Synthesizer (TTS Helper)
 # -----------------------------------------------------------------------------
@@ -300,94 +303,163 @@ class TerrainClassifier:
 # -----------------------------------------------------------------------------
 # Hailo-10H Face Embedder
 # -----------------------------------------------------------------------------
+def l2_normalize(vec: np.ndarray) -> np.ndarray:
+    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(arr))
+    return arr / norm if norm > 0.0 else arr
+
+
 class Hailo10FaceEmbedder:
-    def __init__(self, hef_path):
+    """Computes L2-normalized face embeddings on Hailo-10H using UINT8 [0..255] RGB input."""
+
+    def __init__(self, hef_path: str):
         if not os.path.exists(hef_path):
-            raise FileNotFoundError(f"[ERROR] HEF model missing at {hef_path}")
+            raise FileNotFoundError(f"Hailo HEF model not found: {hef_path}")
 
         params = VDevice.create_params()
         self.target = VDevice(params)
         self.infer_model = self.target.create_infer_model(hef_path)
         self.infer_model.set_batch_size(1)
-        self.infer_model.input().set_format_type(FormatType.FLOAT32)
+        self.infer_model.input().set_format_type(FormatType.UINT8)
         self.infer_model.output().set_format_type(FormatType.FLOAT32)
         self.configured_infer_model = self.infer_model.configure()
 
-    def get_embedding(self, face_crop):
+        in_shape = self.infer_model.input().shape
+        self.input_height = int(in_shape[0]) if len(in_shape) >= 2 else 112
+        self.input_width = int(in_shape[1]) if len(in_shape) >= 2 else 112
+
+    def get_embedding(
+        self, face_crop: np.ndarray, *, input_is_rgb: bool = True
+    ) -> Optional[np.ndarray]:
         try:
             if face_crop is None or face_crop.size == 0:
                 return None
 
-            input_height, input_width = 112, 112
-            
-            # Note: Since the main loop reads and converts frames to RGB, 
-            # face_crop is already RGB. We skip cv2.cvtColor(..., cv2.COLOR_BGR2RGB) 
-            # to prevent channel inversion.
-            resized = cv2.resize(face_crop, (input_width, input_height))
-            normalized = resized.astype(np.float32) / 255.0
-            input_data = np.expand_dims(normalized, axis=0)
+            resized = cv2.resize(
+                face_crop,
+                (self.input_width, self.input_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            rgb_frame = (
+                resized if input_is_rgb else cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            )
+            input_data = np.expand_dims(
+                np.ascontiguousarray(rgb_frame, dtype=np.uint8), axis=0
+            )
 
             bindings = self.configured_infer_model.create_bindings()
             output_tensor = self.infer_model.output()
+            output_buffer = np.empty(output_tensor.shape, dtype=np.float32)
 
             bindings.input().set_buffer(input_data)
-            output_buffer = np.empty(output_tensor.shape, dtype=np.float32)
             bindings.output().set_buffer(output_buffer)
 
             self.configured_infer_model.run([bindings], timeout=5000)
-            embedding = output_buffer.flatten()
-            norm = np.linalg.norm(embedding)
-            return embedding / norm if norm > 0 else embedding
+            return l2_normalize(output_buffer)
         except Exception as e:
             print(f"[LIVE EMBED ERROR]: {e}")
             return None
 
+    def close(self) -> None:
+        self.configured_infer_model = None
+        self.infer_model = None
+        if getattr(self, "target", None) is not None:
+            release_fn = getattr(self.target, "release", None)
+            if callable(release_fn):
+                release_fn()
+            self.target = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
 # -----------------------------------------------------------------------------
 # SQLite Face Database Manager
 # -----------------------------------------------------------------------------
+def _normalize_l2(vec: np.ndarray) -> np.ndarray:
+    arr = np.asarray(vec, dtype=np.float32).reshape(-1).copy()
+    norm = float(np.linalg.norm(arr))
+    return arr / norm if norm > 0.0 else arr
+
+
 class FaceDatabase:
-    def __init__(self, db_path=DB_PATH):
+    def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
-        self.known_embeddings = []
-        self.known_names = []
-        self.known_roles = []
+        self.known_embeddings: list[np.ndarray] = []
+        self.known_names: list[str] = []
+        self.known_roles: list[str] = []
         self.reload_database()
 
-    def reload_database(self):
+    def reload_database(self) -> None:
         self.known_embeddings.clear()
         self.known_names.clear()
         self.known_roles.clear()
 
         if not os.path.exists(self.db_path):
-            print(f"[WARNING] Face database missing at {self.db_path}. Operating in generic person mode.")
+            print(
+                f"[WARNING] Face database missing at {self.db_path}. "
+                "Operating in generic person mode."
+            )
             return
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn = None
         try:
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            cursor = conn.cursor()
             cursor.execute("SELECT name, role, embedding FROM users")
             rows = cursor.fetchall()
+
+            loaded = 0
             for name, role, emb_bytes in rows:
-                vec = np.frombuffer(emb_bytes, dtype=np.float32)
+                if not emb_bytes:
+                    continue
+                vec = _normalize_l2(np.frombuffer(emb_bytes, dtype=np.float32))
+                if vec.size == 0:
+                    continue
                 self.known_embeddings.append(vec)
-                self.known_names.append(name)
-                self.known_roles.append(role)
-            print(f"[INFO] Loaded {len(self.known_names)} profiles from face database.")
+                self.known_names.append(str(name))
+                self.known_roles.append(str(role))
+                loaded += 1
+
+            print(f"[INFO] Loaded {loaded} profiles from face database.")
         except Exception as e:
             print(f"[ERROR] Database error: {e}")
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
-    def match_face(self, query_vector, max_distance=0.65):
+    def match_face(
+        self, query_vector: np.ndarray, max_distance: float = 0.65
+    ) -> tuple[str, str, float]:
         if not self.known_embeddings or query_vector is None:
             return "Unknown", "none", 1.0
 
-        distances = [1.0 - np.dot(query_vector, known_vec) for known_vec in self.known_embeddings]
-        best_match_idx = int(np.argmin(distances))
-        min_dist = distances[best_match_idx]
+        q = _normalize_l2(query_vector)
+        if q.size == 0:
+            return "Unknown", "none", 1.0
+
+        best_match_idx: int | None = None
+        min_dist = float("inf")
+
+        for idx, known_vec in enumerate(self.known_embeddings):
+            if known_vec.shape != q.shape:
+                continue
+            dist = float(max(0.0, 1.0 - np.dot(q, known_vec)))
+            if dist < min_dist:
+                min_dist = dist
+                best_match_idx = idx
+
+        if best_match_idx is None:
+            return "Unknown", "none", 1.0
 
         if min_dist <= max_distance:
-            return self.known_names[best_match_idx], self.known_roles[best_match_idx], min_dist
+            return (
+                self.known_names[best_match_idx],
+                self.known_roles[best_match_idx],
+                min_dist,
+            )
 
         return "Unknown", "none", min_dist
     
@@ -625,19 +697,39 @@ class GestureRecognizer:
                 break
 
         return gesture_cmd, hand_side
+    
 # -----------------------------------------------------------------------------
 # Offline Voice Recognizer (Vosk + PyAudio)
 # -----------------------------------------------------------------------------
 class OfflineVoiceRecognizer:
 
-    def __init__(self, command_queue, model_path, speaker=None, vip_ref_paths=None):
+    def __init__(
+        self,
+        command_queue,
+        model_path,
+        speaker=None,
+        vip_ref_paths=None,
+        speaker_threshold: float = 0.48,
+        short_word_threshold: float = 0.45,
+        post_speech_hold: float = 1.4,
+    ):
         self.command_queue = command_queue
         self.speaker = speaker
         self.is_running = True
-        
+
+        self.speaker_threshold = float(speaker_threshold)
+        self.short_word_threshold = float(short_word_threshold)
+        self.post_speech_hold = float(post_speech_hold)
+
         # Audio configuration (Matches ESP32-C3 firmware sample rate of 16kHz)
-        self.target_rate = 16000  
-        self.audio_buffer = deque(maxlen=150)
+        self.target_rate = 16000
+        self.audio_buffer = deque(maxlen=250)
+
+        self._lock = threading.Lock()
+        self._speaking_active = False
+        self._mute_until = 0.0
+        self._needs_flush = False
+        self._last_reject_tts_time = 0.0
 
         print("[VOICE] Loading offline Vosk model...")
         self.model = Model(model_path)
@@ -648,7 +740,7 @@ class OfflineVoiceRecognizer:
             "left", "right",
             "auto", "track", "follow",
             "chia", "eloy",
-            "[unk]"
+            "[unk]",
         ])
         self.recognizer = KaldiRecognizer(self.model, self.target_rate, self.grammar_json)
 
@@ -660,7 +752,7 @@ class OfflineVoiceRecognizer:
             "back": ("BACKWARD", "Reversing."),
             "reverse": ("BACKWARD", "Reversing."),
             "retreat": ("BACKWARD", "Reversing."),
-            "go": ("BACKWARD", "Reversing."),
+            "go": ("FORWARD", "Moving forward."),
             "stop": ("STOP", "Stopping robot."),
             "halt": ("STOP", "Stopping robot."),
             "wait": ("STOP", "Stopping robot."),
@@ -676,14 +768,16 @@ class OfflineVoiceRecognizer:
         # --- ESP32-C3 SERIAL STREAM SETUP ---
         self.esp_audio_port = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_A4:CB:8F:20:E0:3C-if00"
         self.esp_baud_rate = 921600
-        
+
         try:
-            self.esp_audio_serial = serial.Serial(self.esp_audio_port, self.esp_baud_rate, timeout=0.01)
+            self.esp_audio_serial = serial.Serial(
+                self.esp_audio_port, self.esp_baud_rate, timeout=0.01
+            )
             print(f"[VOICE] Connected to ESP32-C3 Audio Node on {self.esp_audio_port}")
         except Exception as e:
             print(f"[ERROR] Failed to open ESP32 audio stream port: {e}")
             self.esp_audio_serial = None
-        
+
         # Voice encoder setup for verification
         self._init_voice_encoder(vip_ref_paths)
 
@@ -699,25 +793,48 @@ class OfflineVoiceRecognizer:
         Example: [0x03] + "VOICE:STOP\n"
         """
         try:
-            if hasattr(self, 'esp_audio_serial') and self.esp_audio_serial and self.esp_audio_serial.is_open:
-                payload = bytes([0x03]) + f"{source}:{command}\n".encode('utf-8')
+            if hasattr(self, "esp_audio_serial") and self.esp_audio_serial and self.esp_audio_serial.is_open:
+                payload = bytes([0x03]) + f"{source}:{command}\n".encode("utf-8")
                 self.esp_audio_serial.write(payload)
         except Exception as e:
             print(f"[SERIAL TEXT ERROR]: {e}")
 
-    def say_muted(self, text: str, extra_hold: float = 0.0, cooldown: float = 1.2):
+    def set_speaking(self, speaking: bool, cooldown: float | None = None):
+        """Non-blocking TTS mute gate with post-speech reverberation hold."""
+        hold = self.post_speech_hold if cooldown is None else max(0.0, float(cooldown))
+        now = time.monotonic()
+        with self._lock:
+            if speaking:
+                self._speaking_active = True
+                self._mute_until = max(self._mute_until, now + hold)
+                self.audio_buffer.clear()
+            else:
+                self._speaking_active = False
+                self._mute_until = max(self._mute_until, now + hold)
+                self._needs_flush = True
+                self.audio_buffer.clear()
+
+    def _is_muted_and_should_flush(self, now: float) -> tuple[bool, bool]:
+        with self._lock:
+            muted = self._speaking_active or (now < self._mute_until)
+            flush = False
+            if not muted and self._needs_flush:
+                flush = True
+                self._needs_flush = False
+                self.audio_buffer.clear()
+            return muted, flush
+
+    def say_muted(self, text: str, extra_hold: float = 0.0, cooldown: float | None = None):
         """Speaks via self.speaker while keeping Vosk muted during playback + cooldown."""
         if not self.speaker or not text:
             return
-        self.set_speaking(True)
+        hold = self.post_speech_hold if cooldown is None else float(cooldown)
+        total_hold = max(hold, float(extra_hold))
+        self.set_speaking(True, cooldown=total_hold)
         try:
             self.speaker.say(text)
-            # If speaker.say() is non-blocking, estimate ~0.07s per char + extra_hold
-            est_play_time = max(extra_hold, len(text) * 0.07)
-            if est_play_time > 0:
-                time.sleep(est_play_time)
         finally:
-            self.set_speaking(False, cooldown=cooldown)
+            self.set_speaking(False, cooldown=total_hold)
 
     def _init_voice_encoder(self, vip_ref_paths=None):
         """Loads multi-speaker Resemblyzer embeddings from pickle."""
@@ -725,17 +842,17 @@ class OfflineVoiceRecognizer:
             model_path = "authorized_speakers.pkl"
             with open(model_path, "rb") as f:
                 self.speaker_embeddings = pickle.load(f)
-            
+
             if self.speaker_embeddings:
                 print(f"[VOICE] Loaded authorized speaker embeddings successfully: {list(self.speaker_embeddings.keys())}")
             else:
                 print(f"[VOICE WARNING] '{model_path}' loaded, but it is empty.")
                 self.speaker_embeddings = {}
-                
+
         except Exception as e:
             print(f"[VOICE WARNING] Could not load authorized speaker embeddings: {e}")
             self.speaker_embeddings = {}
-            
+
         # Initialize Resemblyzer Voice Encoder
         try:
             from resemblyzer import VoiceEncoder
@@ -744,8 +861,9 @@ class OfflineVoiceRecognizer:
             print(f"[ERROR] Failed to initialize Resemblyzer VoiceEncoder: {e}")
             self.voice_encoder = None
 
-    def _verify_speaker(self, raw_audio, threshold=0.50, min_samples=8000):
+    def _verify_speaker(self, raw_audio, threshold=None, min_samples=4800):
         """Verifies incoming 16kHz 16-bit mono PCM audio against enrolled speaker embeddings."""
+        eff_threshold = self.speaker_threshold if threshold is None else float(threshold)
         if not self.speaker_embeddings or not self.voice_encoder:
             print("[VOICE WARNING] Speaker verification bypassed (no models or encoder loaded).")
             return True, "unknown"
@@ -758,14 +876,16 @@ class OfflineVoiceRecognizer:
             audio_np = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
 
             # Trim leading/trailing silence
-            audio_trimmed, _ = librosa.effects.trim(audio_np, top_db=25)
+            audio_trimmed, _ = librosa.effects.trim(audio_np, top_db=20)
 
             if len(audio_trimmed) < min_samples:
-                print(
-                    f"[VOICE DEBUG] Trimmed audio too short ({len(audio_trimmed)}/{min_samples} samples) "
-                    f"for reliable speaker embedding."
-                )
-                return False, "UNKNOWN"
+                if len(audio_np) < min_samples:
+                    print(
+                        f"[VOICE DEBUG] Audio too short ({len(audio_trimmed)}/{min_samples} samples) "
+                        f"for reliable speaker embedding."
+                    )
+                    return False, "UNKNOWN"
+                audio_trimmed = audio_np
 
             test_embedding = self.voice_encoder.embed_utterance(audio_trimmed)
             test_norm = np.linalg.norm(test_embedding)
@@ -787,10 +907,10 @@ class OfflineVoiceRecognizer:
 
             print(
                 f"[VOICE DEBUG] Best Match: '{matched_speaker}' | "
-                f"Cosine Similarity: {best_score:.4f} (Threshold: {threshold:.2f})"
+                f"Cosine Similarity: {best_score:.4f} (Threshold: {eff_threshold:.2f})"
             )
 
-            if best_score >= threshold:
+            if best_score >= eff_threshold:
                 return True, matched_speaker
 
             return False, matched_speaker
@@ -798,6 +918,13 @@ class OfflineVoiceRecognizer:
         except Exception as e:
             print(f"[VOICE ERROR] Error during speaker verification: {e}")
             return False, "UNKNOWN"
+
+    def _select_command(self, words: list[str]):
+        # Prefer explicit target/mode switches if present in a multi-word phrase
+        for priority_word in ("chia", "eloy", "auto", "track", "follow", "stop", "halt", "wait"):
+            if priority_word in words and priority_word in self.command_map:
+                return self.command_map[priority_word]
+        return next((self.command_map[w] for w in words if w in self.command_map), None)
 
     def _listen_loop(self):
         print("[VOICE DEBUG] _listen_loop thread started...")
@@ -811,27 +938,27 @@ class OfflineVoiceRecognizer:
             def register_cmd(cmd_string, speech_reply):
                 print(f"[VOICE BROADCAST]: {speech_reply}")
                 self.command_queue.put(cmd_string)
-                self.set_speaking(True)
-                try:
-                    if self.speaker:
-                        self.speaker.say(speech_reply)
-                finally:
-                    self.set_speaking(False, cooldown=1.3)
+                self.say_muted(speech_reply, cooldown=self.post_speech_hold)
 
             while self.is_running:
-                if getattr(self, "is_speaking", False):
-                    time.sleep(0.1)
-                    continue
-
-                # Read chunks of raw PCM bytes from the ESP32-C3 USB buffer
                 data = self.esp_audio_serial.read(512)
-
                 if not data or len(data) < 2:
                     continue
 
                 if len(data) % 2 != 0:
                     data = data[:-1]
-                if len(data) == 0:
+                if not data:
+                    continue
+
+                now_mono = time.monotonic()
+                muted, should_flush = self._is_muted_and_should_flush(now_mono)
+
+                if should_flush:
+                    self.recognizer.Reset()
+                    self.audio_buffer.clear()
+
+                if muted:
+                    # Drain serial bytes while speaking/cooling down, but drop them
                     continue
 
                 # Single unified RMS calculation
@@ -852,17 +979,18 @@ class OfflineVoiceRecognizer:
 
                     if text:
                         print(f"\n[VOICE RECOGNIZED RAW TEXT]: '{text}'")
-
                         words = text.split()
-                        matched_entry = next((self.command_map[w] for w in words if w in self.command_map), None)
+                        matched_entry = self._select_command(words)
 
                         if not matched_entry:
                             print(f"[VOICE IGNORED] '{text}' is not in command allowlist.")
                             self.recognizer.Reset()
                             continue
 
-                        # Speaker Verification Check (only for allowlisted commands)
-                        is_verified, speaker_name = self._verify_speaker(utterance_pcm, threshold=0.55)
+                        req_thresh = self.short_word_threshold if len(words) == 1 else self.speaker_threshold
+                        is_verified, speaker_name = self._verify_speaker(
+                            utterance_pcm, threshold=req_thresh
+                        )
                         print(
                             f"[VOICE DEBUG] Speaker Verification Result: {is_verified} "
                             f"({speaker_name}) for '{text}' (RMS: {rms:.1f})"
@@ -870,18 +998,9 @@ class OfflineVoiceRecognizer:
 
                         if not is_verified:
                             print(f"[VOICE REJECTED] Command '{text}' ignored by speaker verification.")
-                            now = time.time()
-                            if (
-                                self.speaker
-                                and len(words) >= 2
-                                and (now - getattr(self, "_last_reject_tts_time", 0.0)) >= 4.0
-                            ):
-                                self._last_reject_tts_time = now
-                                self.set_speaking(True)
-                                try:
-                                    self.speaker.say("Command ignored. Unrecognized voice.")
-                                finally:
-                                    self.set_speaking(False, cooldown=0.5)
+                            if len(words) >= 2 and (now_mono - self._last_reject_tts_time) >= 4.0:
+                                self._last_reject_tts_time = now_mono
+                                self.say_muted("Command ignored. Unrecognized voice.", cooldown=0.6)
                             self.recognizer.Reset()
                             continue
 
@@ -899,27 +1018,6 @@ class OfflineVoiceRecognizer:
             print(f"[VOICE FATAL ERROR CRASH] {e}")
             import traceback
             traceback.print_exc()
-
-    def set_speaking(self, speaking: bool, cooldown: float = 1.3):
-        """Mutes listening while TTS speaks (plus a short tail cooldown) and flushes stale audio."""
-        if speaking:
-            self.is_speaking = True
-            if hasattr(self, "utterance_buffer"):
-                self.utterance_buffer.clear()
-                self.utterance_active = False
-            if hasattr(self, "audio_buffer"):
-                self.audio_buffer.clear()
-        else:
-            if cooldown > 0:
-                time.sleep(cooldown)
-            if hasattr(self, "utterance_buffer"):
-                self.utterance_buffer.clear()
-                self.utterance_active = False
-            if hasattr(self, "audio_buffer"):
-                self.audio_buffer.clear()
-            if hasattr(self, "recognizer") and self.recognizer:
-                self.recognizer.Reset()
-            self.is_speaking = False
 
 # -----------------------------------------------------------------------------
 # Motor Controller (with Auto-Reconnect & Thread-Safe Serial Framing)
@@ -1012,12 +1110,13 @@ class MotorController:
         p_angle = pan_angle if pan_angle is not None else 135.0
         t_angle = tilt_angle if tilt_angle is not None else 85.0
 
-        pan_scaled = max(30, min(240, int(float(p_angle))))
-        tilt_byte = max(0, min(180, int(t_angle)))
+        pan_scaled = max(30, min(240, min(255, int(float(p_angle)))))
+        tilt_byte = max(0, min(180, int(float(t_angle))))
 
         err = steering_error if steering_error is not None else 0
-        encoded_error = max(0, min(255, int(err) + 100))
-        speed_byte = max(0, min(255, int(base_speed)))
+        clamped_err = max(-100, min(100, int(round(float(err)))))
+        encoded_error = max(0, min(255, clamped_err + 100))
+        speed_byte = max(0, min(255, int(round(float(base_speed)))))
 
         packet = bytes([0x02, pan_scaled, tilt_byte, encoded_error, speed_byte])
         self._write_packet(
@@ -1106,20 +1205,24 @@ class DistanceTrackingController:
     def update(self, raw_box_height: float | None, now: float | None = None) -> tuple[str, float | None, bool]:
         """
         Updates smoothed box height and returns (command, smoothed_height, changed).
-        If raw_box_height is None (target lost), safely holds/returns STOP after dwell.
+        If raw_box_height is None or <= 0 (target lost), immediately returns STOP.
         """
         if now is None:
             now = time.monotonic()
 
         if raw_box_height is None or raw_box_height <= 0:
-            desired_cmd = "STOP"
+            changed = self.active_cmd != "STOP"
+            self.active_cmd = "STOP"
+            self._candidate_cmd = "STOP"
+            self._candidate_since = now
+            return self.active_cmd, self.smoothed_height, changed
+
+        h_raw = float(raw_box_height)
+        if self.smoothed_height is None:
+            self.smoothed_height = h_raw
         else:
-            h_raw = float(raw_box_height)
-            if self.smoothed_height is None:
-                self.smoothed_height = h_raw
-            else:
-                self.smoothed_height = (self.alpha * h_raw) + ((1.0 - self.alpha) * self.smoothed_height)
-            desired_cmd = self._classify_with_hysteresis(self.smoothed_height)
+            self.smoothed_height = (self.alpha * h_raw) + ((1.0 - self.alpha) * self.smoothed_height)
+        desired_cmd = self._classify_with_hysteresis(self.smoothed_height)
 
         if desired_cmd != self._candidate_cmd:
             self._candidate_cmd = desired_cmd
@@ -1252,75 +1355,163 @@ class LatestFrameWorker:
     def stop(self):
         self._stop_event.set()
         self._thread.join(timeout=1.0)
+
 # ---------------------------------------------------
 # Helper functions
 # ---------------------------------------------------
-def make_face_worker_fn(detector, embedder, db, get_override_name=None):
-    def _run_face(frame):
+def make_face_worker_fn(
+    detector: Any,
+    embedder: Any,
+    db: Any,
+    get_override_name: Optional[Callable[[], Optional[str]]] = None,
+    *,
+    max_distance: float = 0.72,
+    required_streak: int = 2,
+    frame_is_rgb: bool = True,
+    default_confidence: float = 0.9,
+) -> Callable[[np.ndarray], dict[str, Any]]:
+    """Create a per-frame face detection, embedding match, and authorization worker."""
+    streak_limit = max(1, int(required_streak))
+    log_state: dict[str, Any] = {"last_time": 0.0, "last_name": None}
+    streak_state: dict[str, Any] = {"name": None, "count": 0}
+
+    def _empty_result(ts: float) -> dict[str, Any]:
+        return {"matches": [], "timestamp": ts}
+
+    def _run_face(frame: np.ndarray) -> dict[str, Any]:
         ts = time.time()
-        if detector is None or embedder is None:
-            return {"matches": [], "timestamp": ts}
+        if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
+            return _empty_result(ts)
+
+        if detector is None or embedder is None or db is None:
+            return _empty_result(ts)
 
         h, w = frame.shape[:2]
-        bgr_for_yunet = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        detector.setInputSize((w, h))
-        _, faces = detector.detect(bgr_for_yunet)
-        if faces is None or len(faces) == 0:
-            return {"matches": [], "timestamp": time.time()}
+        if h <= 0 or w <= 0:
+            return _empty_result(ts)
 
-        override_name = get_override_name() if callable(get_override_name) else None
-        matches = []
+        det_input = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if frame_is_rgb else frame
+        detector.setInputSize((w, h))
+        _, faces = detector.detect(det_input)
+
+        if faces is None or len(faces) == 0:
+            streak_state["name"] = None
+            streak_state["count"] = 0
+            return _empty_result(ts)
+
+        override_name: Optional[str] = None
+        if callable(get_override_name):
+            try:
+                raw_override = get_override_name()
+                if raw_override is not None:
+                    override_name = str(raw_override).strip().lower() or None
+            except Exception:
+                override_name = None
+
+        matches: list[dict[str, Any]] = []
 
         for face in faces:
-            fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
-            fx1, fy1 = max(0, fx), max(0, fy)
-            fx2, fy2 = min(w, fx + fw), min(h, fy + fh)
-            crop = frame[fy1:fy2, fx1:fx2]
+            if len(face) < 4:
+                continue
+
+            fx, fy, fw, fh = float(face[0]), float(face[1]), float(face[2]), float(face[3])
+            crop = extract_face_crop(frame, (fx, fy, fw, fh), pad_ratio=0.0)
             if crop.size == 0:
                 continue
 
-            name = "Unknown"
-            role = "none"
-            dist = None
-            if embedder is not None:
-                query_vector = embedder.get_embedding(crop)
-                name, role, dist = db.match_face(query_vector, max_distance=0.65)
+            query_vector = embedder.get_embedding(crop, input_is_rgb=frame_is_rgb)
+            if query_vector is None:
+                continue
 
-            is_known = name is not None and name != "Unknown"
-            is_authorized = bool(
-                is_known
-                and (
-                    str(role).upper() == "VIP_FOLLOW"
-                    or (override_name and str(name).lower() == str(override_name).lower())
+            matched_name, matched_role, dist = db.match_face(
+                query_vector, max_distance=max_distance
+            )
+            name = str(matched_name) if matched_name else "Unknown"
+            role = str(matched_role) if matched_role else "none"
+            is_known = name != "Unknown"
+
+            if not is_known:
+                streak_state["name"] = None
+                streak_state["count"] = 0
+            elif streak_state["name"] == name:
+                streak_state["count"] += 1
+            else:
+                streak_state["name"] = name
+                streak_state["count"] = 1
+
+            streak_count = int(streak_state["count"]) if is_known else 0
+            confirmed_lock = is_known and (streak_count >= streak_limit)
+
+            now = time.monotonic()
+            if (
+                name != log_state["last_name"]
+                or (now - log_state["last_time"]) >= 1.0
+            ):
+                status = "MATCH" if is_known else "REJECT"
+                lock_tag = "LOCKED" if confirmed_lock else f"STREAK {streak_count}/{streak_limit}"
+                dist_str = f"{dist:.4f}" if isinstance(dist, (int, float)) else "N/A"
+                print(
+                    f"[FACE DEBUG] {status} ({lock_tag}) | name={name} ({role}) | "
+                    f"dist={dist_str} | max_distance={max_distance:.2f}",
+                    flush=True,
                 )
+                log_state["last_time"] = now
+                log_state["last_name"] = name
+
+            fx1 = max(0, min(int(round(fx)), w))
+            fy1 = max(0, min(int(round(fy)), h))
+            fx2 = max(0, min(int(round(fx + fw)), w))
+            fy2 = max(0, min(int(round(fy + fh)), h))
+
+            role_allowed = (
+                role.upper() == "VIP_FOLLOW"
+                or (override_name is not None and name.lower() == override_name)
+            )
+            is_authorized = bool(confirmed_lock and role_allowed)
+
+            conf = float(face[14]) if len(face) > 14 else default_confidence
+
+            matches.append(
+                {
+                    "name": name,
+                    "role": role,
+                    "dist": dist,
+                    "bbox": [fx1, fy1, fx2, fy2],
+                    "confidence": conf,
+                    "streak": streak_count,
+                    "confirmed": confirmed_lock,
+                    "authorized": is_authorized,
+                }
             )
 
-            conf = float(face[14]) if len(face) > 14 else 0.9
-            matches.append({
-                "name": name or "Unknown",
-                "role": role or "none",
-                "dist": dist,
-                "bbox": [fx1, fy1, fx2, fy2],
-                "confidence": conf,
-                "authorized": is_authorized,
-            })
-
-        return {"matches": matches, "timestamp": time.time()}
+        return {"matches": matches, "timestamp": ts}
 
     return _run_face
-
-
+# ==========================================================================
 def make_gesture_worker_fn(recognizer):
     def _run_gesture(frame):
         ts = time.time()
         if recognizer is None:
-            return {"raw_cmd": None, "hand_side": "Unknown", "wrist_y": None, "timestamp": ts}
+            return {
+                "raw_cmd": None,
+                "hand_side": "Unknown",
+                "wrist_y": None,
+                "landmarks": None,
+                "timestamp": ts,
+            }
 
         raw_result = recognizer.process_frame(frame, frame.copy())
         wrist_y = getattr(recognizer, "last_wrist_y", None)
+        landmarks = (
+            getattr(recognizer, "last_landmarks", None)
+            or getattr(recognizer, "hand_landmarks", None)
+            or getattr(recognizer, "landmarks", None)
+        )
 
         if isinstance(raw_result, tuple):
-            if len(raw_result) == 3:
+            if len(raw_result) == 4:
+                raw_cmd, hand_side, wrist_y, landmarks = raw_result
+            elif len(raw_result) == 3:
                 raw_cmd, hand_side, wrist_y = raw_result
             elif len(raw_result) == 2:
                 raw_cmd, hand_side = raw_result
@@ -1333,11 +1524,144 @@ def make_gesture_worker_fn(recognizer):
             "raw_cmd": raw_cmd,
             "hand_side": hand_side,
             "wrist_y": wrist_y,
+            "landmarks": landmarks,
             "timestamp": time.time(),
         }
 
     return _run_gesture
+# ==========================================================================
+def extract_face_crop(
+    frame: np.ndarray,
+    bbox: tuple[float, float, float, float],
+    pad_ratio: float = 0.0,
+) -> np.ndarray:
+    """Extract a clamped face bounding-box crop from frame with optional padding."""
+    if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
+        return np.empty((0, 0, 3), dtype=np.uint8)
 
+    h, w = frame.shape[:2]
+    x, y, bw, bh = bbox
+    if bw <= 1.0 or bh <= 1.0 or w <= 0 or h <= 0:
+        return np.empty((0, 0, 3), dtype=np.uint8)
+
+    pad_x = bw * float(pad_ratio)
+    pad_y = bh * float(pad_ratio)
+
+    x1 = max(0, min(w, int(round(x - pad_x))))
+    y1 = max(0, min(h, int(round(y - pad_y))))
+    x2 = max(0, min(w, int(round(x + bw + pad_x))))
+    y2 = max(0, min(h, int(round(y + bh + pad_y))))
+
+    if x2 <= x1 or y2 <= y1:
+        return np.empty((0, 0, 3), dtype=np.uint8)
+
+    return frame[y1:y2, x1:x2]
+
+# ----------------------------------------
+# Target lock
+# ----------------------------------------
+class FaceTargetLocker:
+    """Maintains a stable follow lock from face worker outputs using confirmed & authorized."""
+
+    def __init__(self, hold_timeout_s: float = 0.6) -> None:
+        self.hold_timeout_s = max(0.0, float(hold_timeout_s))
+        self.locked_name: Optional[str] = None
+        self.locked_role: Optional[str] = None
+        self.locked_bbox: Optional[list[int]] = None
+        self.locked_dist: Optional[float] = None
+        self.last_seen_ts: float = 0.0
+
+    def clear(self) -> None:
+        self.locked_name = None
+        self.locked_role = None
+        self.locked_bbox = None
+        self.locked_dist = None
+        self.last_seen_ts = 0.0
+
+    def update(
+        self,
+        face_result: Optional[dict[str, Any]],
+        *,
+        override_name: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        ts = time.monotonic() if now is None else float(now)
+        desired_name = override_name.strip().lower() if override_name else None
+
+        matches = []
+        if isinstance(face_result, dict):
+            raw_matches = face_result.get("matches")
+            if isinstance(raw_matches, list):
+                matches = raw_matches
+
+        # Only consider faces that passed both streak confirmation (confirmed)
+        # and role/override authorization (authorized).
+        eligible: list[dict[str, Any]] = []
+        for m in matches:
+            if not isinstance(m, dict):
+                continue
+            if not (m.get("confirmed") is True and m.get("authorized") is True):
+                continue
+            m_name = str(m.get("name", "")).strip()
+            if not m_name or m_name == "Unknown":
+                continue
+            if desired_name is not None and m_name.lower() != desired_name:
+                continue
+            eligible.append(m)
+
+        if eligible:
+            # Prefer lowest cosine distance, breaking ties by largest bbox area.
+            def _rank(item: dict[str, Any]) -> tuple[float, float]:
+                dist_val = item.get("dist")
+                d = float(dist_val) if isinstance(dist_val, (int, float)) else 999.0
+                bbox = item.get("bbox") or [0, 0, 0, 0]
+                area = max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
+                return (d, -float(area))
+
+            best = min(eligible, key=_rank)
+            self.locked_name = str(best["name"])
+            self.locked_role = str(best.get("role", "none"))
+            self.locked_bbox = best.get("bbox")
+            self.locked_dist = (
+                float(best["dist"]) if isinstance(best.get("dist"), (int, float)) else None
+            )
+            self.last_seen_ts = ts
+            return {
+                "locked": True,
+                "name": self.locked_name,
+                "role": self.locked_role,
+                "bbox": self.locked_bbox,
+                "dist": self.locked_dist,
+                "state": "LOCKED",
+            }
+
+        # No newly confirmed+authorized match this cycle: check grace window.
+        if self.locked_name is not None:
+            if desired_name is not None and self.locked_name.lower() != desired_name:
+                self.clear()
+            elif (ts - self.last_seen_ts) <= self.hold_timeout_s:
+                return {
+                    "locked": True,
+                    "name": self.locked_name,
+                    "role": self.locked_role,
+                    "bbox": self.locked_bbox,
+                    "dist": self.locked_dist,
+                    "state": "HOLDING",
+                }
+            else:
+                self.clear()
+
+        return {
+            "locked": False,
+            "name": None,
+            "role": None,
+            "bbox": None,
+            "dist": None,
+            "state": "UNLOCKED",
+        }
+    
+# -------------------------------------------------------------------
+# smooths noisy per-frame hand gesture outputs
 # -------------------------------------------------------------------
 class GestureDebouncer:
     """Debounces noisy per-frame gesture predictions with sliding-window consensus."""
@@ -1469,8 +1793,13 @@ def main():
     print("[TRACE] Voice module block cleared. Setting up loop variables...")
 
     manual_voice_override = None
+    voice_override_expiry_time = 0.0
+    VOICE_OVERRIDE_DURATION = 4.0
     target_role_to_follow = "VIP_FOLLOW"
     target_name_override = None
+
+    def _get_target_override_name() -> Optional[str]:
+        return target_name_override
 
     class DefaultServoTracker:
         def __init__(self):
@@ -1499,16 +1828,14 @@ def main():
     missing_target_count = 0
     MAX_MISSING_FRAMES = 5
     last_valid_target = None
-    voice_override_expiry_time = 0.0
-    VOICE_OVERRIDE_DURATION = 2.0
     current_terrain = "PAVEMENT"
-
     is_target_locked = False
     locked_body_box = None
     lock_timer = 0.0
     LOCK_TIMEOUT = 5.0
 
     target_clothing_hist = None
+    clothing_locked_name: Optional[str] = None
     is_clothing_locked = False
     CLOTHING_LOCK_TIMEOUT = 2.0
     clothing_lock_timer = 0.0
@@ -1517,6 +1844,15 @@ def main():
     FALL_SPEECH_REPEAT_INTERVAL = 10.0
     current_tracked_name = "Unknown"
     IDEAL_BOX_HEIGHT = 300.0
+
+    def _clear_follow_locks() -> None:
+        nonlocal target_clothing_hist, clothing_locked_name, is_clothing_locked, clothing_lock_timer
+        face_locker.clear()
+        target_clothing_hist = None
+        clothing_locked_name = None
+        is_clothing_locked = False
+        clothing_lock_timer = 0.0
+
     dist_ctrl = DistanceTrackingController(
         ideal_box_height=IDEAL_BOX_HEIGHT,
         height_tolerance=65.0,
@@ -1528,6 +1864,7 @@ def main():
     VOICE_POST_SPEECH_COOLDOWN = 1.2
     ignore_voice_until = 0.0
     VOICE_SPEECH_IGNORE_DURATION = 9.0
+    
 
     FACE_STRIDE = 4
     GESTURE_STRIDE = 5
@@ -1535,7 +1872,19 @@ def main():
     MAX_GESTURE_RESULT_AGE = 0.8
 
     profiler = LoopProfiler(interval=5.0)
-    face_worker = LatestFrameWorker("face", make_face_worker_fn(face_detector, hailo_embedder, face_db))
+    face_locker = FaceTargetLocker(hold_timeout_s=0.6)
+    face_worker = LatestFrameWorker(
+        "face",
+        make_face_worker_fn(
+            face_detector,
+            hailo_embedder,
+            face_db,
+            get_override_name=_get_target_override_name,
+            max_distance=0.72,
+            required_streak=2,
+            frame_is_rgb=True,
+        ),
+    )
     gesture_worker = LatestFrameWorker("gesture", make_gesture_worker_fn(gesture_rec))
     gesture_debouncer = GestureDebouncer(
         window_size=5,
@@ -1608,15 +1957,31 @@ def main():
                     photo_armed = False
                     last_snapshot_time = time.time()
 
+                def _pt_xy(pt):
+                    if hasattr(pt, "x") and hasattr(pt, "y"):
+                        return float(pt.x), float(pt.y)
+                    if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                        return float(pt[0]), float(pt[1])
+                    raise TypeError(f"Unsupported landmark point type: {type(pt).__name__} ({dir(pt)})")
+
                 hand_side = latest_gesture.get("hand_side", "Unknown") if latest_gesture else "Unknown"
-                lm = latest_gesture.get("landmarks") if (latest_gesture and not is_stale) else None
-                if lm is not None:
-                    for p1_idx, p2_idx in HAND_CONNECTIONS:
-                        x1 = int(lm[p1_idx].x * FRAME_WIDTH)
-                        y1 = int(lm[p1_idx].y * FRAME_HEIGHT)
-                        x2 = int(lm[p2_idx].x * FRAME_WIDTH)
-                        y2 = int(lm[p2_idx].y * FRAME_HEIGHT)
-                        cv2.line(display_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                lm = (
+                    latest_gesture.get("landmarks")
+                    if (latest_gesture and (not is_stale or (0.0 <= gest_age_ms <= 250.0)))
+                    else None
+                )
+                if lm:
+                    for conn in HAND_CONNECTIONS:
+                        p1_idx = getattr(conn, "start", conn[0])
+                        p2_idx = getattr(conn, "end", conn[1])
+                        if 0 <= p1_idx < len(lm) and 0 <= p2_idx < len(lm):
+                            x1_norm, y1_norm = _pt_xy(lm[p1_idx])
+                            x2_norm, y2_norm = _pt_xy(lm[p2_idx])
+                            x1 = int(x1_norm * FRAME_WIDTH)
+                            y1 = int(y1_norm * FRAME_HEIGHT)
+                            x2 = int(x2_norm * FRAME_WIDTH)
+                            y2 = int(y2_norm * FRAME_HEIGHT)
+                            cv2.line(display_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
                 if new_gesture_event:
                     persisted_gesture = new_gesture_event
@@ -1648,20 +2013,9 @@ def main():
                     if (current_time - result_ts) <= MAX_FACE_RESULT_AGE:
                         face_matches = latest_face_result.get("matches", [])
 
-                chosen_det = None
-                authorized_face_detected = False
-
                 for match in face_matches:
-                    name = match["name"]
-                    role = match["role"]
-                    fx1, fy1, fx2, fy2 = match["bbox"]
-                    face_conf = match["confidence"]
-
-                    if name != "Unknown" and name is not None:
-                        current_tracked_name = name
-                        if match["authorized"]:
-                            authorized_face_detected = True
-
+                    name = match.get("name")
+                    if name and name != "Unknown":
                         if name not in last_greeted_times or (current_time - last_greeted_times[name] > greeting_cooldown_seconds):
                             if speaker:
                                 if voice_rec and hasattr(voice_rec, "say_muted"):
@@ -1680,19 +2034,43 @@ def main():
                                             voice_rec.set_speaking(False, cooldown=1.4)
                             last_greeted_times[name] = current_time
 
-                    if match["authorized"]:
-                        matched_body_det = None
-                        for det in detections:
-                            bx1, by1, bx2, by2 = det["bbox"]
-                            if bx1 <= fx1 <= bx2 and by1 <= fy1 <= by2:
-                                matched_body_det = det
-                                break
+                filtered_face_result = (
+                    {"matches": face_matches, "timestamp": latest_face_result.get("timestamp", current_time)}
+                    if latest_face_result
+                    else None
+                )
+                lock_status = face_locker.update(
+                    filtered_face_result,
+                    override_name=target_name_override,
+                    now=now_mono,
+                )
 
-                        chosen_det = matched_body_det if matched_body_det else {
-                            "bbox": [fx1, fy1, fx2, fy2],
-                            "confidence": face_conf,
-                        }
+                chosen_det = None
+                authorized_face_detected = False
 
+                if lock_status["locked"] and lock_status["bbox"] is not None:
+                    authorized_face_detected = True
+                    current_tracked_name = lock_status["name"] or current_tracked_name
+                    fx1, fy1, fx2, fy2 = lock_status["bbox"]
+                    face_conf = next(
+                        (m.get("confidence", 0.9) for m in face_matches if m.get("name") == lock_status["name"]),
+                        0.9,
+                    )
+
+                    matched_body_det = None
+                    for det in detections:
+                        bx1, by1, bx2, by2 = det["bbox"]
+                        if bx1 <= fx1 <= bx2 and by1 <= fy1 <= by2:
+                            matched_body_det = det
+                            break
+
+                    chosen_det = matched_body_det if matched_body_det else {
+                        "bbox": [fx1, fy1, fx2, fy2],
+                        "confidence": face_conf,
+                    }
+
+                    # only capture/refresh clothing histogram on a fresh LOCKED state
+                    if lock_status["state"] == "LOCKED":
                         bx1, by1, bx2, by2 = chosen_det["bbox"]
                         torso_ymin = int(by1 + (by2 - by1) * 0.2)
                         torso_ymax = int(by1 + (by2 - by1) * 0.7)
@@ -1713,12 +2091,19 @@ def main():
                                 beta=1,
                                 norm_type=cv2.NORM_MINMAX,
                             )
+                            clothing_locked_name = lock_status["name"]
                             is_clothing_locked = True
                             clothing_lock_timer = current_time
 
-                        break
+                override_matches_clothing = (
+                    target_name_override is None
+                    or (
+                        clothing_locked_name is not None
+                        and clothing_locked_name.strip().lower() == target_name_override.strip().lower()
+                    )
+                )
 
-                if not chosen_det and is_clothing_locked and detections:
+                if not chosen_det and is_clothing_locked and detections and override_matches_clothing:
                     if (current_time - clothing_lock_timer) < CLOTHING_LOCK_TIMEOUT and target_clothing_hist is not None:
                         best_match_det = None
                         highest_score = -1.0
@@ -1754,6 +2139,8 @@ def main():
                         if best_match_det:
                             chosen_det = best_match_det
                             authorized_face_detected = True
+                            if clothing_locked_name:
+                                current_tracked_name = clothing_locked_name
                             cv2.putText(
                                 display_frame,
                                 f"LOCKED TO CLOTHING (Score: {highest_score:.2f})",
@@ -1764,8 +2151,13 @@ def main():
                                 2,
                             )
                     else:
-                        is_clothing_locked = False
                         target_clothing_hist = None
+                        clothing_locked_name = None
+                        is_clothing_locked = False
+                elif not override_matches_clothing:
+                    target_clothing_hist = None
+                    clothing_locked_name = None
+                    is_clothing_locked = False
                 profiler.record("face_and_lock", time.perf_counter() - t0)
 
                 t0 = time.perf_counter()
@@ -1801,21 +2193,35 @@ def main():
                         target_role_to_follow = v_cmd
                         print(f"[MODE] Target Follow Role Updated: {target_role_to_follow}")
                         manual_voice_override = None
+                        voice_override_expiry_time = 0.0
                         target_name_override = None
+                        _clear_follow_locks()
                         dist_ctrl.reset()
 
                     elif v_cmd == "AUTO":
                         print("[MODE] Clearing voice override. Returning to Auto Tracking.")
                         manual_voice_override = None
+                        voice_override_expiry_time = 0.0
                         target_name_override = None
+                        _clear_follow_locks()
                         dist_ctrl.reset()
 
                     elif "ELOY" in v_cmd_str:
-                        target_name_override = "eloy"
+                        if target_name_override != "eloy":
+                            target_name_override = "eloy"
+                            _clear_follow_locks()
+                            dist_ctrl.reset()
+                        manual_voice_override = None
+                        voice_override_expiry_time = 0.0
                         print("[VOICE OVERRIDE]: Switching target directly to Eloy")
 
                     elif "CHIA" in v_cmd_str:
-                        target_name_override = "chia"
+                        if target_name_override != "chia":
+                            target_name_override = "chia"
+                            _clear_follow_locks()
+                            dist_ctrl.reset()
+                        manual_voice_override = None
+                        voice_override_expiry_time = 0.0
                         print("[VOICE OVERRIDE]: Switching target directly to Chia")
 
                     else:
@@ -1823,7 +2229,14 @@ def main():
                         manual_voice_override = v_cmd
                         voice_override_expiry_time = time.time() + VOICE_OVERRIDE_DURATION
 
+                if manual_voice_override is not None and time.time() >= voice_override_expiry_time:
+                    manual_voice_override = None
+                    voice_override_expiry_time = 0.0
+                    print("[MODE] Temporary voice override expired -> returning to GESTURE / TRACKING_DISTANCE")
+
+
                 BOX_ALPHA = 0.25
+                latest_dist_cmd = "STOP"
 
                 if active_target is not None:
                     raw_xmin, raw_ymin, raw_xmax, raw_ymax = active_target["bbox"]
@@ -1860,12 +2273,13 @@ def main():
                         2,
                     )
 
-                    dist_cmd, smoothed_h, dist_changed = dist_ctrl.update(person_box_height)
+                    latest_dist_cmd, _, _ = dist_ctrl.update(person_box_height)
                     if manual_voice_override is None:
-                        current_frame_command = dist_cmd
+                        current_frame_command = latest_dist_cmd
                         current_source = "TRACKING_DISTANCE"
                 else:
                     servo_tracker.smoothed_bbox = None
+                    latest_dist_cmd, _, _ = dist_ctrl.update(None)
 
                 cv2.line(display_frame, (FRAME_WIDTH // 2, 0), (FRAME_WIDTH // 2, FRAME_HEIGHT), (100, 100, 100), 1)
 
@@ -1993,29 +2407,34 @@ def main():
                     elif target_x_center is not None:
                         missing_target_count = 0
 
-                        ALPHA = 0.4
-                        if not hasattr(servo_tracker, "smoothed_x"):
-                            servo_tracker.smoothed_x = target_x_center
-                            servo_tracker.smoothed_y = int((target_bbox[1] + target_bbox[3]) / 2)
-
-                        servo_tracker.smoothed_x = (ALPHA * target_x_center) + ((1 - ALPHA) * servo_tracker.smoothed_x)
+                        ALPHA = 0.35
                         raw_y_center = int((target_bbox[1] + target_bbox[3]) / 2)
-                        servo_tracker.smoothed_y = (ALPHA * raw_y_center) + ((1 - ALPHA) * servo_tracker.smoothed_y)
+                        if (
+                            not hasattr(servo_tracker, "smoothed_x")
+                            or servo_tracker.smoothed_x is None
+                            or not hasattr(servo_tracker, "smoothed_y")
+                            or servo_tracker.smoothed_y is None
+                        ):
+                            servo_tracker.smoothed_x = float(target_x_center)
+                            servo_tracker.smoothed_y = float(raw_y_center)
+                        else:
+                            servo_tracker.smoothed_x = (ALPHA * target_x_center) + ((1.0 - ALPHA) * servo_tracker.smoothed_x)
+                            servo_tracker.smoothed_y = (ALPHA * raw_y_center) + ((1.0 - ALPHA) * servo_tracker.smoothed_y)
 
-                        steering_error = int(servo_tracker.smoothed_x - (FRAME_WIDTH // 2))
-                        vertical_error = int(servo_tracker.smoothed_y - (FRAME_HEIGHT // 2))
+                        steering_error = int(round(servo_tracker.smoothed_x - (FRAME_WIDTH // 2)))
+                        vertical_error = int(round(servo_tracker.smoothed_y - (FRAME_HEIGHT // 2)))
 
-                        DEADZONE_X = 20
-                        DEADZONE_Y = 20
+                        DEADZONE_X = 24
+                        DEADZONE_Y = 24
 
                         if abs(steering_error) < DEADZONE_X:
                             steering_error = 0
                         if abs(vertical_error) < DEADZONE_Y:
                             vertical_error = 0
 
-                        MAX_STEP = 1.5
-                        pan_delta = max(-MAX_STEP, min(MAX_STEP, steering_error * 0.015))
-                        tilt_delta = max(-MAX_STEP, min(MAX_STEP, vertical_error * 0.015))
+                        MAX_STEP = 1.2
+                        pan_delta = max(-MAX_STEP, min(MAX_STEP, steering_error * 0.012))
+                        tilt_delta = max(-MAX_STEP, min(MAX_STEP, vertical_error * 0.012))
                         servo_tracker.pan_angle = max(PAN_MIN, min(PAN_MAX, servo_tracker.pan_angle - pan_delta))
                         servo_tracker.tilt_angle = max(TILT_MIN, min(TILT_MAX, servo_tracker.tilt_angle - tilt_delta))
 
@@ -2024,14 +2443,10 @@ def main():
                         if servo_tracker.tilt_angle <= TILT_MIN or servo_tracker.tilt_angle >= TILT_MAX:
                             vertical_error = 0
 
-                        raw_speed = int(abs(steering_error) * 0.4 + abs(vertical_error) * 0.4)
-                        dynamic_speed = max(10, min(100, raw_speed)) if abs(steering_error) > 5 else 0
+                        raw_speed = int(abs(steering_error) * 0.35 + abs(vertical_error) * 0.35)
+                        dynamic_speed = max(10, min(90, raw_speed)) if abs(steering_error) > 10 else 0
 
-                        xmin, ymin, xmax, ymax = target_bbox
-                        raw_box_height = float(max(0, ymax - ymin))
-                        dist_cmd, smoothed_h, dist_changed = dist_ctrl.update(raw_box_height)
-
-                        current_frame_command = dist_cmd
+                        current_frame_command = latest_dist_cmd
                         current_source = "TRACKING_DISTANCE"
                         is_tracking_active = True
 
@@ -2050,7 +2465,7 @@ def main():
 
                         cv2.putText(
                             display_frame,
-                            "TRACKING (Holding target loss...)",
+                            "TRACKING ACTIVE",
                             (20, 90),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.7,
@@ -2059,28 +2474,26 @@ def main():
                         )
 
                     else:
-                        servo_tracker.pan_angle = 135
-                        servo_tracker.tilt_angle = 95
+                        servo_tracker.smoothed_x = None
+                        servo_tracker.smoothed_y = None
                         is_tracking_active = False
 
-                        dist_cmd, smoothed_h, dist_changed = dist_ctrl.update(None)
-                        current_frame_command = dist_cmd
-                        current_source = "TRACKING_DISTANCE" if dist_cmd != "STOP" else "HOLD"
+                        current_frame_command = latest_dist_cmd
+                        current_source = "TRACKING_DISTANCE" if latest_dist_cmd != "STOP" else "HOLD"
 
-                        current_time = time.time()
                         if current_time - last_serial_send_time >= SERIAL_SEND_INTERVAL:
                             try:
                                 motor.send_hybrid_tracking_command(
                                     servo_tracker.pan_angle,
                                     servo_tracker.tilt_angle,
                                     0,
-                                    50,
+                                    0,
                                 )
                                 last_serial_send_time = current_time
                             except Exception:
                                 pass
 
-                        cv2.putText(display_frame, "STATUS: TARGET LOST - RETURNING HOME", (20, 90),
+                        cv2.putText(display_frame, "STATUS: TARGET LOST", (20, 90),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
                 if current_frame_command:
